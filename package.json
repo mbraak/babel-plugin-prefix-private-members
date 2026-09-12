@@ -1,0 +1,66 @@
+{
+    "name": "babel-plugin-prefix-private-members",
+    "version": "0.1.0",
+    "description": "Babel plugin that prefixes TypeScript private and protected class members, so a minifier can mangle them",
+    "keywords": [
+        "babel",
+        "babel-plugin",
+        "typescript",
+        "private",
+        "protected",
+        "mangle",
+        "terser",
+        "minify"
+    ],
+    "license": "Apache-2.0",
+    "author": "Marco Braak",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/mbraak/babel-plugin-prefix-private-members.git"
+    },
+    "type": "module",
+    "types": "./dist/index.d.ts",
+    "exports": {
+        ".": {
+            "types": "./dist/index.d.ts",
+            "default": "./dist/index.js"
+        },
+        "./package.json": "./package.json"
+    },
+    "files": [
+        "dist/",
+        "README.md",
+        "CHANGELOG.md",
+        "LICENSE"
+    ],
+    "sideEffects": false,
+    "engines": {
+        "node": ">=20"
+    },
+    "packageManager": "pnpm@12.3.4",
+    "scripts": {
+        "build": "rm -rf dist && tsc --project tsconfig.build.json",
+        "check": "pnpm lint && pnpm prettier:check && pnpm tsc && pnpm test && pnpm build",
+        "lint": "eslint src test",
+        "prepack": "pnpm build",
+        "prettier": "prettier --write .",
+        "prettier:check": "prettier --check .",
+        "test": "vitest run",
+        "test:watch": "vitest",
+        "tsc": "tsc --noEmit --project tsconfig.json"
+    },
+    "peerDependencies": {
+        "@babel/core": "^8.0.0"
+    },
+    "devDependencies": {
+        "@babel/core": "^8.0.0",
+        "@babel/preset-typescript": "^8.0.1",
+        "@eslint/js": "^10.0.1",
+        "@types/node": "^22.20.2",
+        "eslint": "^10.10.0",
+        "prettier": "^3.9.6",
+        "typescript": "^6.0.3",
+        "typescript-eslint": "^8.70.0",
+        "vitest": "^5.0.0"
+    }
+}
