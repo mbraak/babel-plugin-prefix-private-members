@@ -128,6 +128,20 @@ pnpm install
 pnpm check     # lint, prettier, tsc, test, build
 ```
 
+### Releasing
+
+Add an entry to `CHANGELOG.md`, then bump the version and push the tag:
+
+```sh
+pnpm version minor    # or patch / major; commits and tags v<version>
+git push --follow-tags
+```
+
+The `Publish` workflow runs on `v*` tags. It verifies that the tag matches
+`package.json`, runs `pnpm check`, and publishes to npm using
+[trusted publishing](https://docs.npmjs.com/trusted-publishers/), so no npm
+token is stored in the repository.
+
 ## License
 
 Apache-2.0
