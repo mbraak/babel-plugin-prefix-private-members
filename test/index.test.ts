@@ -672,9 +672,565 @@ describe("prefix-private-members", () => {
         expect(code).toContain("_addChild(");
     });
 
+    it("prefixes the keys of object parameters with prefixParameterKeys", () => {
+        const code = transform(
+            `
+                class Tree {
+                    public open(node: Node): void {
+                        this.render({ node, level: 1 });
+                        this.render?.({ node });
+                    }
+
+                    private render({ node, level = 0 }: Params): void {}
+                }
+            `,
+            { prefixParameterKeys: true },
+        );
+
+        expect(code).toMatch(
+            /_render\(\{\s*_node: node,\s*_level: level = 0\s*\}\)/,
+        );
+        expect(code).toMatch(
+            /this\._render\(\{\s*_node: node,\s*_level: 1\s*\}\)/,
+        );
+        expect(code).toMatch(/this\._render\?\.\(\{\s*_node: node\s*\}\)/);
+    });
+
+    it("leaves the keys of object parameters alone by default", () => {
+        const code = transform(`
+            class Tree {
+                public open(node: Node): void {
+                    this.render({ node });
+                }
+
+                private render({ node }: Params): void {}
+            }
+        `);
+
+        expect(code).toMatch(/_render\(\{\s*node\s*\}\)/);
+        expect(code).toMatch(/this\._render\(\{\s*node\s*\}\)/);
+        expect(code).not.toContain("_node");
+    });
+
+    it("leaves the keys of a kept public method alone", () => {
+        const code = transform(
+            `
+                class Tree {
+                    public open({ node }: Params): void {
+                        this.open({ node });
+                    }
+                }
+            `,
+            { prefixParameterKeys: true },
+        );
+
+        expect(code).not.toContain("_node");
+    });
+
+    it("prefixes constructor keys, at new and super, for a non-excluded class", () => {
+        const code = transform(
+            `
+                class Handler {
+                    constructor({ element, onClick }: Params) {}
+                }
+
+                class Sub extends Handler {
+                    constructor() {
+                        super({ element: null, onClick() {} });
+                    }
+                }
+
+                class Tree {
+                    private handler = new Handler({
+                        element: this.element,
+                        onClick: () => {},
+                    });
+                }
+            `,
+            {
+                excludeClasses: ["Tree"],
+                prefixParameterKeys: true,
+                prefixPublicMethods: true,
+            },
+        );
+
+        expect(code).toMatch(
+            /constructor\(\{\s*_element: element,\s*_onClick: onClick\s*\}\)/,
+        );
+        expect(code).toMatch(
+            /super\(\{\s*_element: null,\s*_onClick\(\) \{\}\s*\}\)/,
+        );
+        expect(code).toMatch(
+            /new Handler\(\{\s*_element: this\.element,\s*_onClick:/,
+        );
+    });
+
+    it("leaves constructor keys alone for an excluded class or public constructor", () => {
+        const code = transform(
+            `
+                class Tree {
+                    constructor({ element }: Params) {}
+                }
+
+                class Handler {
+                    constructor({ element }: Params) {}
+                }
+
+                const tree = new Tree({ element: null });
+                const handler = new Handler({ element: null });
+            `,
+            { excludeClasses: ["Tree"], prefixParameterKeys: true },
+        );
+
+        // Without prefixPublicMethods a constructor is public API everywhere.
+        expect(code).not.toContain("_element");
+    });
+
+    it("prefixes the keys of a private constructor", () => {
+        const code = transform(
+            `
+                class Tree {
+                    private constructor({ element }: Params) {}
+
+                    public static create(): Tree {
+                        return new Tree({ element: null });
+                    }
+                }
+            `,
+            { prefixParameterKeys: true },
+        );
+
+        expect(code).toMatch(/constructor\(\{\s*_element: element\s*\}\)/);
+        expect(code).toMatch(/new Tree\(\{\s*_element: null\s*\}\)/);
+    });
+
+    it("prefixes constructor keys of a class in another file", () => {
+        const code = transformProject(
+            {
+                "handler.ts": `
+                    export default class Handler {
+                        constructor({ element, onClick }: Params) {}
+                    }
+                `,
+                "index.ts": `
+                    import Handler from "./handler";
+
+                    export class Tree {
+                        private handler = new Handler({
+                            element: document.body,
+                            onClick: () => {},
+                        });
+                    }
+                `,
+            },
+            "index.ts",
+            {
+                excludeClasses: ["Tree"],
+                prefixParameterKeys: true,
+                prefixPublicMethods: true,
+            },
+        );
+
+        expect(code).toMatch(
+            /new Handler\(\{\s*_element: document\.body,\s*_onClick:/,
+        );
+    });
+
+    it("prefixes the keys of an inherited method's parameters", () => {
+        const code = transformProject(
+            {
+                "base.ts": `
+                    export class Base {
+                        protected render({ node }: Params): void {}
+                    }
+                `,
+                "sub.ts": `
+                    import { Base } from "./base";
+
+                    export class Sub extends Base {
+                        public open(node: Node): void {
+                            this.render({ node });
+                            super.render({ node });
+                        }
+                    }
+                `,
+            },
+            "sub.ts",
+            { prefixParameterKeys: true },
+        );
+
+        expect(code).toMatch(/this\._render\(\{\s*_node: node\s*\}\)/);
+        expect(code).toMatch(/super\._render\(\{\s*_node: node\s*\}\)/);
+    });
+
+    it("prefixes the keys passed to another instance with memberAccess all", () => {
+        const code = transform(
+            `
+                class Node {
+                    public addChild(node: Node): void {
+                        node.setParent({ parent: this });
+                    }
+
+                    private setParent({ parent }: Params): void {}
+                }
+            `,
+            { memberAccess: "all", prefixParameterKeys: true },
+        );
+
+        expect(code).toMatch(/node\._setParent\(\{\s*_parent: this\s*\}\)/);
+    });
+
+    it("is idempotent for keys that are already prefixed", () => {
+        const code = transform(
+            `
+                class Tree {
+                    public open(node: Node): void {
+                        this.render({ _node: node });
+                    }
+
+                    private render({ _node: node }: Params): void {}
+                }
+            `,
+            { prefixParameterKeys: true },
+        );
+
+        expect(code).not.toContain("__node");
+    });
+
     it("rejects an unknown memberAccess option", () => {
         expect(() =>
             transform("class Tree {}", { memberAccess: "nope" }),
         ).toThrow(/memberAccess/);
+    });
+});
+
+describe("following types", () => {
+    const publicOptions: Options = {
+        excludeClasses: ["Tree"],
+        prefixPublicMethods: true,
+    };
+
+    it("rewrites a call through a member typed with a class in another file", () => {
+        const code = transformProject(
+            {
+                "handler.ts": `
+                    export default class Handler {
+                        public getState(): string { return ""; }
+                    }
+                `,
+                "tree.ts": `
+                    import Handler from "./handler";
+
+                    export class Tree {
+                        private handler: Handler;
+
+                        public getState(): string {
+                            return this.handler.getState();
+                        }
+                    }
+                `,
+            },
+            "tree.ts",
+            publicOptions,
+        );
+
+        expect(code).toContain("this._handler._getState()");
+        expect(code).toMatch(/\n\s+getState\(\) \{/);
+    });
+
+    it("rewrites a call through a typed parameter of a plain function", () => {
+        const code = transform(`
+            class Node {
+                private setParent(parent: Node): void {}
+            }
+
+            function attach(node: Node, parent: Node): void {
+                node.setParent(parent);
+            }
+        `);
+
+        expect(code).toContain("node._setParent(parent)");
+    });
+
+    it("rewrites a call through a variable initialised with new", () => {
+        const code = transform(
+            `
+                class Handler {
+                    public run(): void {}
+                }
+
+                const handler = new Handler();
+                handler.run();
+            `,
+            publicOptions,
+        );
+
+        expect(code).toContain("handler._run()");
+    });
+
+    it("rewrites a call through a variable holding the result of a renamed method", () => {
+        const code = transform(
+            `
+                class Handler {
+                    public run(): void {}
+                }
+
+                class Tree {
+                    public start(): void {
+                        const handler = this.createHandler();
+                        handler.run();
+                        this.createHandler().run();
+                    }
+
+                    private createHandler(): Handler {
+                        return new Handler();
+                    }
+                }
+            `,
+            publicOptions,
+        );
+
+        expect(code).toContain("const handler = this._createHandler()");
+        expect(code).toContain("handler._run()");
+        expect(code).toContain("this._createHandler()._run()");
+    });
+
+    it("infers the return type of a method from what it returns", () => {
+        const code = transform(
+            `
+                class Handler {
+                    public run(): void {}
+                }
+
+                class Tree {
+                    public start(): void {
+                        this.createHandler().run();
+                    }
+
+                    private createHandler() {
+                        return new Handler();
+                    }
+                }
+            `,
+            publicOptions,
+        );
+
+        expect(code).toContain("this._createHandler()._run()");
+    });
+
+    it("rewrites calls on the elements of a typed array", () => {
+        const code = transform(
+            `
+                class Handler {
+                    public run(): void {}
+                }
+
+                class Tree {
+                    private handlers: Handler[] = [];
+
+                    public start(): void {
+                        for (const handler of this.handlers) {
+                            handler.run();
+                        }
+
+                        this.handlers[0].run();
+                    }
+                }
+            `,
+            publicOptions,
+        );
+
+        expect(code).toContain("handler._run()");
+        expect(code).toContain("this._handlers[0]._run()");
+    });
+
+    it("rewrites a static call through the class name", () => {
+        const code = transform(
+            `
+                class Handler {
+                    public static create(): Handler {
+                        return new Handler();
+                    }
+                }
+
+                Handler.create();
+            `,
+            publicOptions,
+        );
+
+        expect(code).toContain("Handler._create()");
+    });
+
+    it("rewrites a call through a cast", () => {
+        const code = transform(
+            `
+                class Handler {
+                    public run(): void {}
+                }
+
+                function start(x: unknown): void {
+                    (x as Handler).run();
+                }
+            `,
+            publicOptions,
+        );
+
+        expect(code).toContain("._run()");
+    });
+
+    it("rewrites a call through a destructured parameter typed by a local interface", () => {
+        const code = transform(
+            `
+                class Handler {
+                    public run(): void {}
+                }
+
+                interface Params {
+                    handler: Handler;
+                }
+
+                function start({ handler }: Params): void {
+                    handler.run();
+                }
+            `,
+            publicOptions,
+        );
+
+        expect(code).toContain("handler._run()");
+    });
+
+    it("rewrites a call through a member typed with an imported function type", () => {
+        const code = transformProject(
+            {
+                "handler.ts": `
+                    export default class Handler {
+                        public run(): void {}
+                    }
+                `,
+                "types.ts": `
+                    import type Handler from "./handler";
+
+                    export type GetHandler = () => Handler;
+                `,
+                "tree.ts": `
+                    import type { GetHandler } from "./types";
+
+                    export class Tree {
+                        private getHandler: GetHandler;
+
+                        public start(): void {
+                            this.getHandler().run();
+                        }
+                    }
+                `,
+            },
+            "tree.ts",
+            publicOptions,
+        );
+
+        expect(code).toContain("this._getHandler()._run()");
+    });
+
+    it("leaves an object of unknown type alone", () => {
+        const code = transform(
+            `
+                class Handler {
+                    public run(): void {}
+                }
+
+                function start(x): void {
+                    x.run();
+                }
+            `,
+            publicOptions,
+        );
+
+        expect(code).toContain("x.run()");
+    });
+
+    it("does not resolve this inside a nested regular function", () => {
+        const code = transform(`
+            class Tree {
+                public start(): void {
+                    setTimeout(function () {
+                        this.render();
+                    });
+                }
+
+                private render(): void {}
+            }
+        `);
+
+        expect(code).toContain("this.render()");
+        expect(code).toContain("_render()");
+    });
+
+    it("keeps a method that implements an interface", () => {
+        const code = transform(
+            `
+                interface Hint {
+                    remove(): void;
+                }
+
+                class GhostHint implements Hint {
+                    public remove(): void {}
+
+                    public other(): void {}
+                }
+
+                class Tree {
+                    private hint: Hint;
+
+                    public clear(): void {
+                        this.hint.remove();
+                    }
+                }
+            `,
+            publicOptions,
+        );
+
+        expect(code).toMatch(/\n\s+remove\(\) \{/);
+        expect(code).toContain("_other()");
+        expect(code).toContain("this._hint.remove()");
+        expect(code).not.toContain("_remove");
+    });
+
+    it("keeps the methods of the built-in protocols", () => {
+        const code = transform(
+            `
+                class Url {
+                    public toString(): string {
+                        return "";
+                    }
+
+                    public toJSON(): string {
+                        return this.toString();
+                    }
+                }
+            `,
+            publicOptions,
+        );
+
+        expect(code).not.toContain("_toString");
+        expect(code).not.toContain("_toJSON");
+    });
+
+    it("keeps the members in excludeMembers", () => {
+        const code = transform(
+            `
+                class Tree {
+                    private render(): void {}
+
+                    private draw(): void {
+                        this.render();
+                    }
+                }
+            `,
+            { excludeMembers: ["render"] },
+        );
+
+        expect(code).toContain("this.render()");
+        expect(code).not.toContain("_render");
+        expect(code).toContain("_draw()");
     });
 });

@@ -60,9 +60,9 @@ run before presets, so the order above is right).
   members, abstract declarations and `accessor` fields.
 - Parameter properties: `constructor(private element: HTMLElement)` renames the
   member and the parameter binding in the constructor body.
-- `this.x` and `super.x` references inside the class body, including inside
-  arrow functions. Nested non-arrow functions and nested classes are skipped,
-  because their `this` is a different object.
+- References to the renamed members: `this.x` and `super.x`, and `node.x`
+  wherever the type of `node` is known from an annotation, see
+  [How references are found](#how-references-are-found).
 - Members inherited from a base class: when a class extends a class imported
   over a relative path or a configured alias, that file is parsed and its
   private/protected member names are renamed in the subclass too, recursively
@@ -70,8 +70,10 @@ run before presets, so the order above is right).
   alone.
 
 Not renamed: public members, members without a modifier, constructors, computed
-keys, and anything already starting with the prefix. The plugin is idempotent,
-so it is safe to run over source that is already prefixed by hand.
+keys, the methods of the built-in protocols (`toString`, `valueOf`, `toJSON`,
+`then`, the custom element callbacks), the names in `excludeMembers`, and
+anything already starting with the prefix. The plugin is idempotent, so it is
+safe to run over source that is already prefixed by hand.
 
 ## Options
 
@@ -84,6 +86,8 @@ so it is safe to run over source that is already prefixed by hand.
 | `root`                | `process.cwd()`            | What `aliases` are resolved against.                                                                     |
 | `prefixPublicMethods` | `false`                    | Also rename the public methods of every class not in `excludeClasses`, see below.                        |
 | `excludeClasses`      | `[]`                       | Classes whose public methods keep their names.                                                           |
+| `excludeMembers`      | `[]`                       | Member names that are never renamed, in any class.                                                       |
+| `prefixParameterKeys` | `false`                    | Also rename the keys of object parameters of renamed methods and constructors, see below.                |
 
 ```json
 {
@@ -132,24 +136,84 @@ method that is renamed in the base class is renamed in the subclass too, and a
 public method that an excluded base class keeps stays in the subclass as well,
 so overrides keep working.
 
-References are rewritten as for private members, so a renamed public method
-must be reached through `this.` / `super.`, or through `memberAccess: "all"`
-or the file comment described below. A public method that another file calls
-by name belongs to a class in `excludeClasses`.
+A method that implements a member of an interface named in the class's
+`implements` clause keeps its name too: an object typed with the interface is
+how it is called. Methods called through an object whose type the plugin cannot
+read (see below) need their class in `excludeClasses`, or their name in
+`excludeMembers`.
 
-## Accessing private members of another instance
+## Prefixing the keys of object parameters
 
-`memberAccess: "this"` only rewrites `this.x` and `super.x`, because deciding
-whether `node.x` is _this_ class's `x` needs type information Babel does not
-have. A class that reaches into the private members of other instances of
-itself needs more, and can ask for it per file with a comment anywhere in the
-file:
+A method that takes its arguments as one object, `render({ node, level })`,
+has keys a minifier cannot mangle either. `prefixParameterKeys: true` renames
+the keys of the object pattern parameters of every renamed method, and the
+keys of the object literals passed to it:
+
+```ts
+class Tree {
+    public open(node: Node) {
+        this.render({ node, level: 1 }); //  ->  this._render({ _node: node, _level: 1 })
+    }
+
+    private render({ node, level = 0 }: Params) {} //  ->  _render({ _node: node, _level: level = 0 })
+}
+```
+
+Constructors follow the public methods: the keys of a constructor's object
+parameter are renamed when the class is not in `excludeClasses` and
+`prefixPublicMethods` is on, or when the constructor is `private` or
+`protected`. The literals passed to `super(...)` and to `new X(...)` are
+rewritten as well, also when `X` is imported from another project file:
+
+```ts
+import MouseHandler from "./mouseHandler";
+
+new MouseHandler({ element, onClick }); //  ->  new MouseHandler({ _element: element, _onClick: onClick })
+```
+
+Only the literal written at the call is rewritten. An object built elsewhere
+and passed as a variable, a spread, a nested object, or a parameter typed as
+an object without destructuring (`params: Params` with `params.node`) is not
+followed. The calls themselves are found as described next.
+
+## How references are found
+
+A reference `object.x` is rewritten when the plugin knows which class `object`
+is an instance of. It reads the type annotations in the source for that, with
+no type checker involved:
+
+- `this` and `super` are the enclosing class, except inside a nested non-arrow
+  function, whose `this` is something else.
+- A member: `this.handler.x` follows the declared type of `handler`, in this
+  class or a base class, and `this.getHandler().x` the return type of the
+  method or getter. A method without a return type that returns `new X(...)`
+  counts as returning `X`.
+- A variable or parameter: its annotation (`node: Node`), its initializer
+  (`new Node()`, or any expression the plugin can type), the array it is taken
+  from in a `for...of` or an index (`nodes[0]`), or, for a destructured
+  parameter `{ node }: Params`, the `node` property of the interface or type
+  literal.
+- A class used as a value: `Handler.create()` for static members.
+- A cast: `(x as Node).y`.
+- A call to a function declared in the file, by its return type.
+
+Types are read as `Node`, `Node | null`, `Node[]`, `Array<Node>`,
+`readonly Node[]`, `() => Node`, and type aliases and interfaces of those,
+declared in the same file or imported from another project file. Classes from
+packages, union types, generics and anything inferred rather than annotated
+are not followed: such an object is left alone, and a method reached only
+through it must be excluded, or renamed by name as described next.
+
+### Renaming by name
+
+Where the type is unknown, a comment anywhere in the file asks the plugin to
+rename every `<expr>.x` in that file whose name is renamed in that same file:
 
 ```ts
 // prefix-private-members: all
 
 class Node {
-    public addChild(node: Node): void {
+    public addChild(node): void {
         node.setParent(this); //  ->  node._setParent(this)
     }
 
@@ -157,12 +221,11 @@ class Node {
 }
 ```
 
-That renames every `<expr>.x` in the file whose name is private or protected in
-that same file. It is per file rather than the default because private member
-names are not unique: `document.createElement()` in a file that declares a
-`private createElement()` would be renamed too, and break.
-
-Setting the `memberAccess: "all"` option turns this on for every file.
+It is per file rather than the default because member names are not unique:
+`document.createElement()` in a file that declares a `private createElement()`
+would be renamed too, and break. Objects whose type is known are still
+rewritten by type in that mode. Setting the `memberAccess: "all"` option turns
+this on for every file.
 
 ## Development
 
