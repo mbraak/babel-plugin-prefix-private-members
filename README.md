@@ -75,13 +75,15 @@ so it is safe to run over source that is already prefixed by hand.
 
 ## Options
 
-| Option          | Default                    | Description                                                                                              |
-| --------------- | -------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `prefix`        | `"_"`                      | Prefix to add.                                                                                           |
-| `accessibility` | `["private", "protected"]` | Which modifiers to rename.                                                                               |
-| `memberAccess`  | `"this"`                   | `"this"` rewrites `this.x` and `super.x` only. `"all"` rewrites every `<expr>.x` in the file, see below. |
-| `aliases`       | `{}`                       | Import prefix to directory, for non-relative imports that are project files: `{ "app/": "./src/" }`.     |
-| `root`          | `process.cwd()`            | What `aliases` are resolved against.                                                                     |
+| Option                | Default                    | Description                                                                                              |
+| --------------------- | -------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `prefix`              | `"_"`                      | Prefix to add.                                                                                           |
+| `accessibility`       | `["private", "protected"]` | Which modifiers to rename.                                                                               |
+| `memberAccess`        | `"this"`                   | `"this"` rewrites `this.x` and `super.x` only. `"all"` rewrites every `<expr>.x` in the file, see below. |
+| `aliases`             | `{}`                       | Import prefix to directory, for non-relative imports that are project files: `{ "app/": "./src/" }`.     |
+| `root`                | `process.cwd()`            | What `aliases` are resolved against.                                                                     |
+| `prefixPublicMethods` | `false`                    | Also rename the public methods of every class not in `excludeClasses`, see below.                        |
+| `excludeClasses`      | `[]`                       | Classes whose public methods keep their names.                                                           |
 
 ```json
 {
@@ -93,6 +95,47 @@ so it is safe to run over source that is already prefixed by hand.
     ]
 }
 ```
+
+## Prefixing public methods
+
+Inside a library, most classes are internal, and their public methods are
+public only to the other files of the library. `prefixPublicMethods: true`
+renames those too, and `excludeClasses` lists the classes whose public methods
+are the actual API.
+
+```json
+{
+    "plugins": [
+        [
+            "prefix-private-members",
+            { "prefixPublicMethods": true, "excludeClasses": ["Tree"] }
+        ]
+    ]
+}
+```
+
+```ts
+export class Tree {
+    public open() {} //  ->  open (Tree is excluded)
+    private render() {} //  ->  _render
+}
+
+class Node {
+    public element: HTMLElement; //  ->  element (a property)
+    public setParent(parent: Node) {} //  ->  _setParent
+}
+```
+
+Only methods are renamed, with or without a `public` modifier. Properties,
+getters and setters keep their names. A subclass follows its base classes: a
+method that is renamed in the base class is renamed in the subclass too, and a
+public method that an excluded base class keeps stays in the subclass as well,
+so overrides keep working.
+
+References are rewritten as for private members, so a renamed public method
+must be reached through `this.` / `super.`, or through `memberAccess: "all"`
+or the file comment described below. A public method that another file calls
+by name belongs to a class in `excludeClasses`.
 
 ## Accessing private members of another instance
 

@@ -456,6 +456,222 @@ describe("prefix-private-members", () => {
         expect(code).toContain("this.container.focus()");
     });
 
+    it("prefixes members inherited from a base class in the same file", () => {
+        const code = transform(`
+            class Base {
+                protected container: HTMLElement;
+            }
+
+            class Sub extends Base {
+                public clear(): void {
+                    this.container.remove();
+                }
+            }
+        `);
+
+        expect(code).toContain("_container;");
+        expect(code).toContain("this._container.remove()");
+    });
+
+    it("prefixes public methods with prefixPublicMethods", () => {
+        const code = transform(
+            `
+                class Tree {
+                    public element: HTMLElement;
+                    count = 0;
+
+                    constructor(public options: object) {}
+
+                    public open(): void {
+                        this.render();
+                        this.element.focus();
+                    }
+
+                    close(): void {
+                        this.open();
+                    }
+
+                    public static create(): Tree {
+                        return new Tree({});
+                    }
+
+                    public get size(): number {
+                        return this.count;
+                    }
+
+                    private render(): void {}
+                }
+            `,
+            { prefixPublicMethods: true },
+        );
+
+        expect(code).toContain("_open()");
+        expect(code).toContain("_close()");
+        expect(code).toContain("this._open()");
+        expect(code).toContain("this._render()");
+        expect(code).toContain("static _create()");
+        expect(code).toContain("constructor(");
+        expect(code).not.toContain("_constructor");
+        expect(code).toContain("this.element.focus()");
+        expect(code).not.toContain("_element");
+        expect(code).not.toContain("_count");
+        expect(code).not.toContain("_options");
+        expect(code).toContain("get size()");
+        expect(code).not.toContain("_size");
+    });
+
+    it("leaves the public methods of excluded classes alone", () => {
+        const code = transform(
+            `
+                class Tree {
+                    public open(): void {
+                        this.render();
+                    }
+
+                    private render(): void {}
+                }
+
+                class Node {
+                    public open(): void {}
+                }
+            `,
+            { excludeClasses: ["Tree"], prefixPublicMethods: true },
+        );
+
+        expect(code).toMatch(/class Tree \{\s*open\(\)/);
+        expect(code).toContain("this._render()");
+        expect(code).toContain("_render()");
+        expect(code).toMatch(/class Node \{\s*_open\(\)/);
+    });
+
+    it("leaves public methods alone without prefixPublicMethods", () => {
+        const code = transform(
+            `
+                class Tree {
+                    public open(): void {}
+                }
+            `,
+            { excludeClasses: ["Other"] },
+        );
+
+        expect(code).toContain("open()");
+        expect(code).not.toContain("_open");
+    });
+
+    it("renames an inherited public method of a base class in another file", () => {
+        const code = transformProject(
+            {
+                "base.ts": `
+                    export class Base {
+                        public open(): void {}
+                        public element: HTMLElement;
+                    }
+                `,
+                "sub.ts": `
+                    import { Base } from "./base";
+
+                    export class Sub extends Base {
+                        public run(): void {
+                            this.open();
+                            this.element.focus();
+                        }
+                    }
+                `,
+            },
+            "sub.ts",
+            { prefixPublicMethods: true },
+        );
+
+        expect(code).toContain("_run()");
+        expect(code).toContain("this._open()");
+        expect(code).toContain("this.element.focus()");
+    });
+
+    it("renames an override of a renamed base method in an excluded class", () => {
+        const code = transformProject(
+            {
+                "base.ts": `
+                    export class Base {
+                        public open(): void {}
+                    }
+                `,
+                "sub.ts": `
+                    import { Base } from "./base";
+
+                    export class Sub extends Base {
+                        public open(): void {
+                            super.open();
+                        }
+
+                        public run(): void {
+                            this.open();
+                        }
+                    }
+                `,
+            },
+            "sub.ts",
+            { excludeClasses: ["Sub"], prefixPublicMethods: true },
+        );
+
+        expect(code).toContain("_open()");
+        expect(code).toContain("super._open()");
+        expect(code).toContain("this._open()");
+        expect(code).toContain("run()");
+        expect(code).not.toContain("_run");
+    });
+
+    it("keeps an override of a kept method of an excluded base class", () => {
+        const code = transformProject(
+            {
+                "base.ts": `
+                    export class Base {
+                        public open(): void {}
+                    }
+                `,
+                "sub.ts": `
+                    import { Base } from "./base";
+
+                    export class Sub extends Base {
+                        public open(): void {
+                            super.open();
+                        }
+
+                        public run(): void {
+                            this.open();
+                        }
+                    }
+                `,
+            },
+            "sub.ts",
+            { excludeClasses: ["Base"], prefixPublicMethods: true },
+        );
+
+        expect(code).toContain("open()");
+        expect(code).not.toContain("_open");
+        expect(code).toContain("super.open()");
+        expect(code).toContain("_run()");
+    });
+
+    it("renames an inherited public method with the file directive", () => {
+        const code = transform(
+            `
+                // prefix-private-members: all
+
+                class Node {
+                    public addChild(node: Node): void {
+                        node.setParent(this);
+                    }
+
+                    public setParent(parent: Node): void {}
+                }
+            `,
+            { prefixPublicMethods: true },
+        );
+
+        expect(code).toContain("node._setParent(this)");
+        expect(code).toContain("_addChild(");
+    });
+
     it("rejects an unknown memberAccess option", () => {
         expect(() =>
             transform("class Tree {}", { memberAccess: "nope" }),

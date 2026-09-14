@@ -32,6 +32,19 @@ Options
                     ({ "app/": "./src/" }). Used to find base classes.
     root            string, default process.cwd(): what `aliases` are relative
                     to.
+    prefixPublicMethods
+                    boolean, default false: also rename the public methods
+                    (with or without a `public` modifier) of every class that
+                    is not listed in `excludeClasses`. Properties, getters and
+                    setters keep their names; a public method of an excluded
+                    class is public API.
+    excludeClasses  array, default []: names of the classes whose public
+                    methods keep their names.
+
+A subclass follows the decisions of its base classes: a method that is renamed
+in the base class is renamed in the subclass too, whatever its modifier there,
+and a public method that an excluded base class keeps stays in the subclass as
+well, so that overrides keep working.
 
 A class that reaches into the private members of *other* instances of itself
 (`node.setParent(this)`) needs more than `this.`, and a comment at the top of
@@ -74,6 +87,8 @@ export interface Options {
     accessibility?: string[];
     /** Import prefix -> directory, resolved against `root`. */
     aliases?: Record<string, string>;
+    /** Classes whose public methods `prefixPublicMethods` leaves alone. */
+    excludeClasses?: string[];
     /**
      * "this" (the default) or "all". Typed as a string because it comes out of
      * a JSON config file, and is checked at runtime.
@@ -81,16 +96,23 @@ export interface Options {
     memberAccess?: string;
     /** Default "_". */
     prefix?: string;
+    /**
+     * Also rename the public methods of every class not in `excludeClasses`.
+     * Default false.
+     */
+    prefixPublicMethods?: boolean;
     /** Default process.cwd(). */
     root?: string;
 }
 
 // The plugin options as the base class walk needs them: parsed, and with the
-// cache key that tells two different accessibility lists apart.
+// cache key that tells two different member selections apart.
 interface BaseClassOptions {
     accessibility: Set<string>;
     aliases: Record<string, string>;
     cacheKey: string;
+    excludeClasses: Set<string>;
+    prefixPublicMethods: boolean;
 }
 
 // Everything a class body can hold, of which only the four member types below
@@ -115,6 +137,11 @@ interface ImportedClass {
 interface LocalClass {
     classNode: t.ClassDeclaration;
 }
+
+// For every member name a class declares or inherits: true when it is
+// renamed, false when it keeps its name. A subclass has to follow the base
+// class here, or an override would end up under a different name.
+type MemberDecisions = Map<string, boolean>;
 
 type MemberNode =
     | t.ClassAccessorProperty
@@ -154,11 +181,9 @@ const setName = (node: t.Node, name: string): void => {
 const getModuleExportName = (node: t.Identifier | t.StringLiteral): string =>
     node.type === "Identifier" ? node.name : node.value;
 
-// Key of a member declaration that this plugin may rename, or null.
-const getMemberKey = (
-    member: ClassBodyMember,
-    accessibility: Set<string>,
-): null | t.Node => {
+// Key of a member declaration that has a name this plugin could rename, or
+// null: a constructor, a computed key, a static block or an index signature.
+const getMemberKey = (member: ClassBodyMember): null | t.Node => {
     if (!isMemberNode(member)) {
         return null;
     }
@@ -170,23 +195,37 @@ const getMemberKey = (
         return null;
     }
 
-    if (
-        member.accessibility == null ||
-        !accessibility.has(member.accessibility)
-    ) {
-        return null;
-    }
-
     return member.key;
 };
 
-const getMemberName = (
-    member: ClassBodyMember,
-    accessibility: Set<string>,
-): null | string => {
-    const key = getMemberKey(member, accessibility);
+const isMethod = (member: ClassBodyMember): boolean =>
+    (member.type === "ClassMethod" || member.type === "TSDeclareMethod") &&
+    member.kind === "method";
 
-    return key == null ? null : getName(key);
+// Whether a class renames its public methods: only when asked to, and not for
+// the excluded classes. An anonymous class cannot be excluded.
+const renamesPublicMethods = (
+    classNode: t.Class,
+    options: BaseClassOptions,
+): boolean =>
+    options.prefixPublicMethods &&
+    (classNode.id == null || !options.excludeClasses.has(classNode.id.name));
+
+// Whether a member with this modifier is one to rename, going by the modifier
+// alone.
+const isRenamedMember = (
+    accessibility: null | string | undefined,
+    method: boolean,
+    publicMethods: boolean,
+    options: BaseClassOptions,
+): boolean => {
+    if (accessibility != null && options.accessibility.has(accessibility)) {
+        return true;
+    }
+
+    const isPublic = accessibility == null || accessibility === "public";
+
+    return method && isPublic && publicMethods;
 };
 
 // `constructor(private container: HTMLElement)` declares a member *and* a
@@ -219,7 +258,7 @@ const getParameterIdentifier = (
 const EXTENSIONS = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs"];
 
 const parsedFiles = new Map<string, { mtimeMs: number; program: t.Program }>();
-const baseClassMembers = new Map<string, string[]>();
+const baseClassMembers = new Map<string, MemberDecisions>();
 
 // Base classes are parsed once and kept, keyed on the file's mtime so that a
 // watching build picks up an edited base class.
@@ -412,54 +451,97 @@ const findExportedClass = (
     return {};
 };
 
-const getOwnMemberNames = (
+// The decisions of one class about the members it declares itself, going by
+// their modifiers.
+const getOwnMemberDecisions = (
     classNode: t.Class,
-    accessibility: Set<string>,
-): string[] =>
-    classNode.body.body.flatMap((member) => {
-        const names = [];
-        const name = getMemberName(member, accessibility);
+    options: BaseClassOptions,
+): MemberDecisions => {
+    const decisions: MemberDecisions = new Map();
+    const publicMethods = renamesPublicMethods(classNode, options);
+
+    for (const member of classNode.body.body) {
+        if (!isMemberNode(member)) {
+            continue;
+        }
+
+        const key = getMemberKey(member);
+        const name = key == null ? null : getName(key);
 
         if (name != null) {
-            names.push(name);
+            decisions.set(
+                name,
+                isRenamedMember(
+                    member.accessibility,
+                    isMethod(member),
+                    publicMethods,
+                    options,
+                ),
+            );
         }
 
         for (const parameterProperty of getParameterProperties(member)) {
-            if (
-                parameterProperty.accessibility != null &&
-                accessibility.has(parameterProperty.accessibility)
-            ) {
-                const parameterName = getName(
-                    getParameterIdentifier(parameterProperty),
-                );
+            const parameterName = getName(
+                getParameterIdentifier(parameterProperty),
+            );
 
-                if (parameterName != null) {
-                    names.push(parameterName);
-                }
+            if (parameterName != null) {
+                decisions.set(
+                    parameterName,
+                    isRenamedMember(
+                        parameterProperty.accessibility,
+                        false,
+                        publicMethods,
+                        options,
+                    ),
+                );
             }
         }
+    }
 
-        return names;
-    });
+    return decisions;
+};
+
+// Adds the decisions of a base class, for the names the subclass does not
+// decide about itself: the nearest declaration wins.
+const addInheritedDecisions = (
+    decisions: MemberDecisions,
+    inherited: MemberDecisions,
+): MemberDecisions => {
+    for (const [name, renamed] of inherited) {
+        if (!decisions.has(name)) {
+            decisions.set(name, renamed);
+        }
+    }
+
+    return decisions;
+};
 
 // The members of one class plus the ones it inherits.
-const getClassMemberNames = (
+const getClassMemberDecisions = (
     classNode: t.Class,
     programNode: t.Program,
     file: string,
     options: BaseClassOptions,
     seen: Set<string>,
-): string[] => [
-    ...getOwnMemberNames(classNode, options.accessibility),
-    ...getBaseClassMemberNames(classNode, programNode, file, options, seen),
-];
+): MemberDecisions =>
+    addInheritedDecisions(
+        getOwnMemberDecisions(classNode, options),
+        getBaseClassMemberDecisions(
+            classNode,
+            programNode,
+            file,
+            options,
+            seen,
+        ),
+    );
 
-const getExportedClassMemberNames = (
+const getExportedClassMemberDecisions = (
     file: string,
     exportName: string,
     options: BaseClassOptions,
     seen: Set<string>,
-): string[] => {
+): MemberDecisions => {
     const key = `${file}::${exportName}::${options.cacheKey}`;
     const cached = baseClassMembers.get(key);
 
@@ -469,28 +551,28 @@ const getExportedClassMemberNames = (
 
     if (seen.has(key)) {
         // A cycle in the imports; the names are already being collected.
-        return [];
+        return new Map();
     }
 
     seen.add(key);
 
     const programNode = parseFile(file);
     const { classNode, redirect } = findExportedClass(programNode, exportName);
-    let names: string[] = [];
+    let decisions: MemberDecisions = new Map();
 
     if (redirect) {
         const source = resolveModule(redirect.source, file, options.aliases);
 
-        names = source
-            ? getExportedClassMemberNames(
-                  source,
-                  redirect.exportName,
-                  options,
-                  seen,
-              )
-            : [];
+        if (source) {
+            decisions = getExportedClassMemberDecisions(
+                source,
+                redirect.exportName,
+                options,
+                seen,
+            );
+        }
     } else if (classNode) {
-        names = getClassMemberNames(
+        decisions = getClassMemberDecisions(
             classNode,
             programNode,
             file,
@@ -499,33 +581,33 @@ const getExportedClassMemberNames = (
         );
     }
 
-    baseClassMembers.set(key, names);
+    baseClassMembers.set(key, decisions);
 
-    return names;
+    return decisions;
 };
 
 // Members that `class X extends Y` inherits from Y, wherever Y lives.
-const getBaseClassMemberNames = (
+const getBaseClassMemberDecisions = (
     classNode: t.Class,
     programNode: t.Program,
     file: string,
     options: BaseClassOptions,
     seen: Set<string>,
-): string[] => {
+): MemberDecisions => {
     const { superClass } = classNode;
 
     if (superClass?.type !== "Identifier") {
-        return [];
+        return new Map();
     }
 
     const classSource = findClassSource(programNode, superClass.name);
 
     if (!classSource) {
-        return [];
+        return new Map();
     }
 
     if ("classNode" in classSource) {
-        return getClassMemberNames(
+        return getClassMemberDecisions(
             classSource.classNode,
             programNode,
             file,
@@ -537,13 +619,13 @@ const getBaseClassMemberNames = (
     const source = resolveModule(classSource.source, file, options.aliases);
 
     return source
-        ? getExportedClassMemberNames(
+        ? getExportedClassMemberDecisions(
               source,
               classSource.exportName,
               options,
               seen,
           )
-        : [];
+        : new Map<string, boolean>();
 };
 
 // Property name of `a.b` / `a?.b`, or null when it cannot be renamed.
@@ -617,6 +699,8 @@ export default function prefixPrivateMembers(
         );
     }
 
+    const prefixPublicMethods = options.prefixPublicMethods ?? false;
+    const excludeClasses = new Set(options.excludeClasses ?? []);
     const root = options.root ?? process.cwd();
     const aliases = Object.fromEntries(
         Object.entries(options.aliases ?? {}).map(([alias, target]) => [
@@ -627,52 +711,86 @@ export default function prefixPrivateMembers(
     const baseClassOptions: BaseClassOptions = {
         accessibility,
         aliases,
-        cacheKey: [...accessibility].sort().join(","),
+        cacheKey: JSON.stringify([
+            [...accessibility].sort(),
+            prefixPublicMethods,
+            [...excludeClasses].sort(),
+        ]),
+        excludeClasses,
+        prefixPublicMethods,
     };
 
-    // Members inherited from base classes: declared elsewhere, but referenced
-    // here, so they need the same rename.
-    const getInheritedRenames = (
+    // The decisions of the base classes: declared elsewhere, but referenced
+    // and possibly overridden here.
+    const getInheritedDecisions = (
         classPath: NodePath<t.Class>,
         programPath: NodePath<t.Program>,
         filename: string | undefined,
-    ): Map<string, string> => {
-        const renames = new Map<string, string>();
-
+    ): MemberDecisions => {
         if (filename == null) {
-            return renames;
+            return new Map();
         }
 
-        const names = getBaseClassMemberNames(
+        return getBaseClassMemberDecisions(
             classPath.node,
             programPath.node,
             filename,
             baseClassOptions,
             new Set(),
         );
+    };
 
-        for (const name of names) {
-            if (!name.startsWith(prefix)) {
-                renames.set(name, `${prefix}${name}`);
-            }
+    // Whether to rename this name, and to what: the base class decides for
+    // the names it declares, the modifier for the rest.
+    const getNewName = (
+        name: string,
+        renamed: boolean,
+        inherited: MemberDecisions,
+    ): null | string => {
+        if (name.startsWith(prefix)) {
+            return null;
         }
 
-        return renames;
+        return (inherited.get(name) ?? renamed) ? `${prefix}${name}` : null;
     };
 
     // Renames the declarations of one class and returns them as old -> new.
     const renameDeclarations = (
         classPath: NodePath<t.Class>,
+        inherited: MemberDecisions,
     ): Map<string, string> => {
         const renames = new Map<string, string>();
+        const publicMethods = renamesPublicMethods(
+            classPath.node,
+            baseClassOptions,
+        );
 
         for (const memberPath of classPath.get("body").get("body")) {
-            const key = getMemberKey(memberPath.node, accessibility);
+            const member = memberPath.node;
+
+            if (!isMemberNode(member)) {
+                continue;
+            }
+
+            const key = getMemberKey(member);
             const name = key == null ? null : getName(key);
 
-            if (key != null && name != null && !name.startsWith(prefix)) {
-                renames.set(name, `${prefix}${name}`);
-                setName(key, `${prefix}${name}`);
+            if (key != null && name != null) {
+                const newName = getNewName(
+                    name,
+                    isRenamedMember(
+                        member.accessibility,
+                        isMethod(member),
+                        publicMethods,
+                        baseClassOptions,
+                    ),
+                    inherited,
+                );
+
+                if (newName != null) {
+                    renames.set(name, newName);
+                    setName(key, newName);
+                }
             }
 
             if (!memberPath.isClassMethod()) {
@@ -682,27 +800,48 @@ export default function prefixPrivateMembers(
             for (const parameterProperty of getParameterProperties(
                 memberPath.node,
             )) {
-                if (
-                    parameterProperty.accessibility == null ||
-                    !accessibility.has(parameterProperty.accessibility)
-                ) {
-                    continue;
-                }
-
                 const identifier = getParameterIdentifier(parameterProperty);
                 const parameterName = getName(identifier);
 
-                if (parameterName == null || parameterName.startsWith(prefix)) {
+                if (parameterName == null) {
                     continue;
                 }
 
-                renames.set(parameterName, `${prefix}${parameterName}`);
-                renameParameter(
-                    memberPath,
-                    identifier,
+                const newName = getNewName(
                     parameterName,
-                    `${prefix}${parameterName}`,
+                    isRenamedMember(
+                        parameterProperty.accessibility,
+                        false,
+                        publicMethods,
+                        baseClassOptions,
+                    ),
+                    inherited,
                 );
+
+                if (newName != null) {
+                    renames.set(parameterName, newName);
+                    renameParameter(
+                        memberPath,
+                        identifier,
+                        parameterName,
+                        newName,
+                    );
+                }
+            }
+        }
+
+        return renames;
+    };
+
+    // The inherited names that are renamed, as old -> new.
+    const getInheritedRenames = (
+        inherited: MemberDecisions,
+    ): Map<string, string> => {
+        const renames = new Map<string, string>();
+
+        for (const [name, renamed] of inherited) {
+            if (renamed && !name.startsWith(prefix)) {
+                renames.set(name, `${prefix}${name}`);
             }
         }
 
@@ -778,31 +917,45 @@ export default function prefixPrivateMembers(
                 const allRenames = new Map<string, string>();
                 const rewriteAll =
                     memberAccess === "all" || hasAllDirective(state.file);
+                const classPaths: NodePath<t.Class>[] = [];
 
                 programPath.traverse({
                     Class(classPath) {
-                        const renames = new Map([
-                            ...getInheritedRenames(
-                                classPath,
-                                programPath,
-                                state.filename,
-                            ),
-                            ...renameDeclarations(classPath),
-                        ]);
-
-                        if (renames.size === 0) {
-                            return;
-                        }
-
-                        if (!rewriteAll) {
-                            rewriteInstanceReferences(classPath, renames);
-                        }
-
-                        for (const [name, newName] of renames) {
-                            allRenames.set(name, newName);
-                        }
+                        classPaths.push(classPath);
                     },
                 });
+
+                // Inherited members are looked up first, in the file as
+                // written: a base class in this same file is renamed below
+                // too, and its members would otherwise already be prefixed
+                // by the time its subclass looks them up.
+                const classes = classPaths.map((classPath) => ({
+                    classPath,
+                    inherited: getInheritedDecisions(
+                        classPath,
+                        programPath,
+                        state.filename,
+                    ),
+                }));
+
+                for (const { classPath, inherited } of classes) {
+                    const renames = new Map([
+                        ...getInheritedRenames(inherited),
+                        ...renameDeclarations(classPath, inherited),
+                    ]);
+
+                    if (renames.size === 0) {
+                        continue;
+                    }
+
+                    if (!rewriteAll) {
+                        rewriteInstanceReferences(classPath, renames);
+                    }
+
+                    for (const [name, newName] of renames) {
+                        allRenames.set(name, newName);
+                    }
+                }
 
                 if (rewriteAll && allRenames.size > 0) {
                     rewriteAllReferences(programPath, allRenames);
