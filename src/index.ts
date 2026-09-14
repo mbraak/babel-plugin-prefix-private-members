@@ -32,14 +32,17 @@ Options
                     ({ "app/": "./src/" }). Used to find base classes.
     root            string, default process.cwd(): what `aliases` are relative
                     to.
-    prefixPublicMethods
-                    boolean, default false: also rename the public methods
-                    (with or without a `public` modifier) of every class that
-                    is not listed in `excludeClasses`. Properties, getters and
-                    setters keep their names; a public method of an excluded
-                    class is public API.
+    prefixPublicMembers
+                    boolean, default false: also rename the public members
+                    (with or without a `public` modifier: methods, properties,
+                    accessors, statics) of every class that is not listed in
+                    `excludeClasses`. The public members of an excluded class
+                    are the public API.
     excludeClasses  array, default []: names of the classes whose public
-                    methods keep their names.
+                    members keep their names.
+    excludeFunctions
+                    array, default []: names of the functions whose object
+                    parameter keys keep their names under `prefixParameterKeys`.
     excludeMembers  array, default []: member names that are never renamed,
                     in any class. The methods of the built-in protocols
                     (`toString`, `valueOf`, `toJSON`, `then`, the custom
@@ -52,13 +55,19 @@ Options
                     the keys of the object literals passed to them through
                     `this.x(...)`, `super.x(...)`, `super(...)` and
                     `new X(...)`, where X is a project class. The constructor
-                    follows the public methods: its keys are renamed when the
-                    class is not excluded and `prefixPublicMethods` is on, or
+                    follows the public members: its keys are renamed when the
+                    class is not excluded and `prefixPublicMembers` is on, or
                     when the constructor is private or protected.
+                    Functions get the same treatment: a function declaration
+                    or a variable holding an arrow or function expression,
+                    called directly by name in its file or through an import,
+                    except the names in `excludeFunctions`. A function that
+                    is also used as a value (passed as a callback, stored)
+                    keeps its keys: its objects then come from elsewhere.
 
 A subclass follows the decisions of its base classes: a method that is renamed
 in the base class is renamed in the subclass too, whatever its modifier there,
-and a public method that an excluded base class keeps stays in the subclass as
+and a public member that an excluded base class keeps stays in the subclass as
 well, so that overrides keep working.
 
 A class that reaches into the private members of *other* instances of itself
@@ -107,8 +116,10 @@ export interface Options {
     accessibility?: string[];
     /** Import prefix -> directory, resolved against `root`. */
     aliases?: Record<string, string>;
-    /** Classes whose public methods `prefixPublicMethods` leaves alone. */
+    /** Classes whose public members `prefixPublicMembers` leaves alone. */
     excludeClasses?: string[];
+    /** Functions whose object parameter keys `prefixParameterKeys` leaves alone. */
+    excludeFunctions?: string[];
     /** Member names that are never renamed, in any class. Default []. */
     excludeMembers?: string[];
     /**
@@ -125,10 +136,10 @@ export interface Options {
      */
     prefixParameterKeys?: boolean;
     /**
-     * Also rename the public methods of every class not in `excludeClasses`.
+     * Also rename the public members of every class not in `excludeClasses`.
      * Default false.
      */
-    prefixPublicMethods?: boolean;
+    prefixPublicMembers?: boolean;
     /** Default process.cwd(). */
     root?: string;
 }
@@ -140,8 +151,9 @@ interface BaseClassOptions {
     aliases: Record<string, string>;
     cacheKey: string;
     excludeClasses: Set<string>;
+    excludeFunctions: Set<string>;
     excludeMembers: Set<string>;
-    prefixPublicMethods: boolean;
+    prefixPublicMembers: boolean;
 }
 
 // Members that the runtime or a library calls by name, whatever the class:
@@ -308,9 +320,6 @@ const isMethodNode = (
 const isConstructor = (member: ClassBodyMember): boolean =>
     isMethodNode(member) && member.kind === "constructor";
 
-const isMethod = (member: ClassBodyMember): boolean =>
-    isMethodNode(member) && member.kind === "method";
-
 // The name a member is decided about: CONSTRUCTOR for the constructor.
 const getDecisionName = (member: MemberNode): null | string => {
     if (isConstructor(member)) {
@@ -322,23 +331,22 @@ const getDecisionName = (member: MemberNode): null | string => {
     return key == null ? null : getName(key);
 };
 
-// Whether a class renames its public methods: only when asked to, and not for
-// the excluded classes. An anonymous class cannot be excluded.
-const renamesPublicMethods = (
+// Whether a class renames its public members: only when asked to, and not
+// for the excluded classes. An anonymous class cannot be excluded.
+const renamesPublicMembers = (
     classNode: t.Class,
     options: BaseClassOptions,
 ): boolean =>
-    options.prefixPublicMethods &&
+    options.prefixPublicMembers &&
     (classNode.id == null || !options.excludeClasses.has(classNode.id.name));
 
 // Whether a member with this name and modifier is one to rename, going by
-// those alone. The constructor counts as a method here: its name stays, but
-// the keys of its object parameters follow the public methods.
+// those alone. For the constructor this decides about the keys of its object
+// parameters; its name always stays.
 const isRenamedMember = (
     name: string,
     accessibility: null | string | undefined,
-    method: boolean,
-    publicMethods: boolean,
+    publicMembers: boolean,
     options: BaseClassOptions,
 ): boolean => {
     if (PROTOCOL_MEMBERS.has(name) || options.excludeMembers.has(name)) {
@@ -351,7 +359,7 @@ const isRenamedMember = (
 
     const isPublic = accessibility == null || accessibility === "public";
 
-    return method && isPublic && publicMethods;
+    return isPublic && publicMembers;
 };
 
 // The object pattern of a parameter: `{ node }` or `{ node } = {}`.
@@ -392,7 +400,7 @@ const getObjectKeys = (
 // Per parameter of a method, the keys of its object pattern; null when there
 // is no object pattern among the parameters.
 const getParameterKeys = (
-    member: t.ClassMethod | t.TSDeclareMethod,
+    member: t.Function | t.TSDeclareMethod,
 ): (null | string[])[] | null => {
     const keys = member.params.map((parameter) => {
         const pattern = getObjectPattern(parameter);
@@ -459,6 +467,7 @@ const parseFile = (file: string): t.Program => {
 
     parsedFiles.set(file, { mtimeMs, program: ast.program });
     baseClassMembers.clear();
+    functionDecisions.clear();
 
     return ast.program;
 };
@@ -624,6 +633,384 @@ const findExportedClass = (
     }
 
     return {};
+};
+
+// A function whose object parameter keys the plugin may rename: a function
+// declaration, or an arrow or function expression held by a variable.
+type NamedFunction =
+    t.ArrowFunctionExpression | t.FunctionDeclaration | t.FunctionExpression;
+
+// What the plugin decides about the parameters of a function.
+interface FunctionDecision {
+    parameterKeys: (null | string[])[] | null;
+    renamed: boolean;
+}
+
+const isNamedFunction = (node: t.Node): node is NamedFunction =>
+    node.type === "ArrowFunctionExpression" ||
+    node.type === "FunctionDeclaration" ||
+    node.type === "FunctionExpression";
+
+// The function a variable declarator holds, with its name.
+const getDeclaredFunction = (
+    node: t.Node,
+): null | { fn: NamedFunction; name: string } => {
+    if (node.type === "FunctionDeclaration" && node.id) {
+        return { fn: node, name: node.id.name };
+    }
+
+    if (
+        node.type === "VariableDeclarator" &&
+        node.id.type === "Identifier" &&
+        node.init &&
+        isNamedFunction(node.init)
+    ) {
+        return { fn: node.init, name: node.id.name };
+    }
+
+    return null;
+};
+
+// A function declared at the top level of a file, by name.
+const findLocalFunction = (
+    programNode: t.Program,
+    name: string,
+): null | { fn: NamedFunction; name: string } => {
+    for (const node of programNode.body) {
+        const declaration =
+            node.type === "ExportNamedDeclaration" ||
+            node.type === "ExportDefaultDeclaration"
+                ? node.declaration
+                : node;
+
+        if (declaration?.type === "VariableDeclaration") {
+            for (const declarator of declaration.declarations) {
+                const declared = getDeclaredFunction(declarator);
+
+                if (declared?.name === name) {
+                    return declared;
+                }
+            }
+        } else if (declaration) {
+            const declared = getDeclaredFunction(declaration);
+
+            if (declared?.name === name) {
+                return declared;
+            }
+        }
+    }
+
+    return null;
+};
+
+// What an export name points at: the function itself, or a re-export to
+// follow. Mirrors findExportedClass.
+const findExportedFunction = (
+    programNode: t.Program,
+    exportName: string,
+): {
+    declared?: null | { fn: NamedFunction; name: null | string };
+    redirect?: ImportedClass;
+} => {
+    for (const node of programNode.body) {
+        if (
+            node.type === "ExportDefaultDeclaration" &&
+            exportName === "default"
+        ) {
+            const { declaration } = node;
+
+            if (declaration.type === "Identifier") {
+                return {
+                    declared: findLocalFunction(programNode, declaration.name),
+                };
+            }
+
+            if (isNamedFunction(declaration)) {
+                return {
+                    declared: {
+                        fn: declaration,
+                        name:
+                            declaration.type === "FunctionDeclaration"
+                                ? (declaration.id?.name ?? null)
+                                : null,
+                    },
+                };
+            }
+        }
+
+        if (node.type !== "ExportNamedDeclaration") {
+            continue;
+        }
+
+        if (node.declaration) {
+            const declared = findLocalFunction(
+                { ...programNode, body: [node] },
+                exportName,
+            );
+
+            if (declared) {
+                return { declared };
+            }
+        }
+
+        for (const specifier of node.specifiers) {
+            if (
+                specifier.type !== "ExportSpecifier" ||
+                getModuleExportName(specifier.exported) !== exportName
+            ) {
+                continue;
+            }
+
+            if (node.source) {
+                return {
+                    redirect: {
+                        exportName: getModuleExportName(specifier.local),
+                        source: node.source.value,
+                    },
+                };
+            }
+
+            return {
+                declared: findLocalFunction(
+                    programNode,
+                    getModuleExportName(specifier.local),
+                ),
+            };
+        }
+    }
+
+    return {};
+};
+
+// The indexes of the parameters that are object patterns.
+const getObjectPatternIndexes = (fn: NamedFunction): number[] =>
+    fn.params.flatMap((parameter, index) =>
+        getObjectPattern(parameter) ? [index] : [],
+    );
+
+// A literal whose keys can all be renamed: no spread, whose keys are unknown.
+const isPlainObjectLiteral = (node: t.Node | undefined): boolean =>
+    node?.type === "ObjectExpression" &&
+    node.properties.every((property) => property.type !== "SpreadElement");
+
+// How a file uses a function of its own. The keys of its object parameters
+// can only be renamed when every object it receives is a literal written at
+// a call: a function that is also passed around as a value, or called with an
+// object built elsewhere, gets its objects from somewhere the plugin does not
+// see. The check goes by name over the whole file, which is on the safe side
+// for a name that is declared twice.
+interface FunctionUse {
+    /** Whether other files can reach the function. */
+    exported: boolean;
+    /** Whether every use is a call with a literal for each object parameter. */
+    safe: boolean;
+}
+
+const analyzeFunctionUse = (
+    programNode: t.Program,
+    name: string,
+    fn: NamedFunction,
+): FunctionUse => {
+    const patternIndexes = getObjectPatternIndexes(fn);
+    const use: FunctionUse = { exported: false, safe: true };
+
+    const visit = (node: t.Node, parent: t.Node | null): void => {
+        if (
+            (node.type === "ExportNamedDeclaration" ||
+                node.type === "ExportDefaultDeclaration") &&
+            node.declaration
+        ) {
+            const declarations =
+                node.declaration.type === "VariableDeclaration"
+                    ? node.declaration.declarations
+                    : [node.declaration];
+
+            if (
+                declarations.some(
+                    (declaration) =>
+                        getDeclaredFunction(declaration)?.fn === fn,
+                )
+            ) {
+                use.exported = true;
+            }
+        }
+
+        if (node.type === "Identifier" && node.name === name && parent) {
+            const isCall =
+                (parent.type === "CallExpression" ||
+                    parent.type === "OptionalCallExpression") &&
+                parent.callee === node;
+            const isDeclaration =
+                (parent.type === "FunctionDeclaration" && parent.id === node) ||
+                (parent.type === "VariableDeclarator" && parent.id === node) ||
+                parent.type === "ImportSpecifier" ||
+                parent.type === "ImportDefaultSpecifier";
+            const isExport =
+                parent.type === "ExportSpecifier" ||
+                parent.type === "ExportDefaultDeclaration";
+            const isPropertyName =
+                ((parent.type === "MemberExpression" ||
+                    parent.type === "OptionalMemberExpression") &&
+                    parent.property === node &&
+                    !parent.computed) ||
+                ((parent.type === "ObjectProperty" ||
+                    parent.type === "ObjectMethod" ||
+                    parent.type === "ClassProperty" ||
+                    parent.type === "ClassMethod" ||
+                    parent.type === "TSPropertySignature" ||
+                    parent.type === "TSMethodSignature") &&
+                    parent.key === node &&
+                    !parent.computed);
+            const isType =
+                parent.type === "TSTypeReference" ||
+                parent.type === "TSTypeQuery" ||
+                parent.type === "TSInterfaceDeclaration" ||
+                parent.type === "TSTypeAliasDeclaration";
+
+            if (isExport) {
+                use.exported = true;
+            } else if (isCall) {
+                const call = parent as t.CallExpression;
+
+                for (const index of patternIndexes) {
+                    const argument = call.arguments[index];
+
+                    if (argument && !isPlainObjectLiteral(argument)) {
+                        use.safe = false;
+                    }
+                }
+            } else if (!isDeclaration && !isPropertyName && !isType) {
+                use.safe = false;
+            }
+        }
+
+        forEachChildNode(node, (child) => {
+            visit(child, node);
+        });
+    };
+
+    visit(programNode, null);
+
+    return use;
+};
+
+// Whether an interface or type alias is declared in this file without being
+// exported: a type that only this file can name.
+const isPrivateType = (programNode: t.Program, name: string): boolean =>
+    programNode.body.some(
+        (node) =>
+            (node.type === "TSInterfaceDeclaration" ||
+                node.type === "TSTypeAliasDeclaration") &&
+            node.id.name === name,
+    );
+
+// Whether the object parameters of a function are typed with types private
+// to its file. For a function that other files can call, that is the sign
+// that the objects are written at the calls: an object of an exported type
+// may come from anywhere, like the options a library user passes in.
+const hasPrivateParameterTypes = (
+    fn: NamedFunction,
+    programNode: t.Program,
+): boolean =>
+    getObjectPatternIndexes(fn).every((index) => {
+        const parameter = fn.params[index];
+        const pattern = parameter ? getObjectPattern(parameter) : null;
+        const annotation = pattern?.typeAnnotation;
+
+        if (annotation?.type !== "TSTypeAnnotation") {
+            return false;
+        }
+
+        const type = annotation.typeAnnotation;
+
+        return (
+            type.type === "TSTypeLiteral" ||
+            (type.type === "TSTypeReference" &&
+                type.typeName.type === "Identifier" &&
+                isPrivateType(programNode, type.typeName.name))
+        );
+    });
+
+const getFunctionDecision = (
+    fn: NamedFunction,
+    name: null | string,
+    programNode: t.Program,
+    options: BaseClassOptions,
+): FunctionDecision => {
+    const parameterKeys = getParameterKeys(fn);
+
+    if (
+        parameterKeys == null ||
+        name == null ||
+        options.excludeFunctions.has(name)
+    ) {
+        return { parameterKeys, renamed: false };
+    }
+
+    const use = analyzeFunctionUse(programNode, name, fn);
+
+    return {
+        parameterKeys,
+        renamed:
+            use.safe &&
+            (!use.exported || hasPrivateParameterTypes(fn, programNode)),
+    };
+};
+
+const functionDecisions = new Map<string, FunctionDecision>();
+
+// The decision about a function exported by another project file.
+const getExportedFunctionDecision = (
+    file: string,
+    exportName: string,
+    options: BaseClassOptions,
+    seen: Set<string>,
+): FunctionDecision | null => {
+    const key = `${file}::${exportName}::${options.cacheKey}`;
+    const cached = functionDecisions.get(key);
+
+    if (cached) {
+        return cached;
+    }
+
+    if (seen.has(key)) {
+        return null;
+    }
+
+    seen.add(key);
+
+    const programNode = parseFile(file);
+    const { declared, redirect } = findExportedFunction(
+        programNode,
+        exportName,
+    );
+    let decision: FunctionDecision | null = null;
+
+    if (redirect) {
+        const source = resolveModule(redirect.source, file, options.aliases);
+
+        decision = source
+            ? getExportedFunctionDecision(
+                  source,
+                  redirect.exportName,
+                  options,
+                  seen,
+              )
+            : null;
+    } else if (declared) {
+        decision = getFunctionDecision(
+            declared.fn,
+            declared.name,
+            programNode,
+            options,
+        );
+    }
+
+    if (decision) {
+        functionDecisions.set(key, decision);
+    }
+
+    return decision;
 };
 
 // What a class name used in a file refers to: a class in that file, or an
@@ -1224,7 +1611,7 @@ const getOwnMemberDecisions = (
     options: BaseClassOptions,
 ): MemberDecisions => {
     const decisions: MemberDecisions = new Map();
-    const publicMethods = renamesPublicMethods(classNode, options);
+    const publicMembers = renamesPublicMembers(classNode, options);
     const implemented = getImplementedMemberNames(
         classNode,
         programNode,
@@ -1249,8 +1636,7 @@ const getOwnMemberDecisions = (
                     isRenamedMember(
                         name,
                         member.accessibility,
-                        isMethod(member) || isConstructor(member),
-                        publicMethods,
+                        publicMembers,
                         options,
                     ),
                 type: getMemberType(member, programNode, file, options),
@@ -1269,8 +1655,7 @@ const getOwnMemberDecisions = (
                         isRenamedMember(
                             parameterName,
                             parameterProperty.accessibility,
-                            false,
-                            publicMethods,
+                            publicMembers,
                             options,
                         ),
                     type:
@@ -1498,6 +1883,8 @@ interface FileContext {
     filename: string | undefined;
     /** The decisions of the classes in this file, merged with their bases. */
     localDecisions: Map<t.Class, MemberDecisions>;
+    /** The decisions about the named functions in this file. */
+    localFunctions: Map<NamedFunction, FunctionDecision>;
     /** The decisions of the base classes of the classes in this file. */
     localInherited: Map<t.Class, MemberDecisions>;
     programNode: t.Program;
@@ -1533,10 +1920,11 @@ export default function prefixPrivateMembers(
         );
     }
 
-    const prefixPublicMethods = options.prefixPublicMethods ?? false;
+    const prefixPublicMembers = options.prefixPublicMembers ?? false;
     const prefixParameterKeys = options.prefixParameterKeys ?? false;
     const excludeClasses = new Set(options.excludeClasses ?? []);
     const excludeMembers = new Set(options.excludeMembers ?? []);
+    const excludeFunctions = new Set(options.excludeFunctions ?? []);
     const root = options.root ?? process.cwd();
     const aliases = Object.fromEntries(
         Object.entries(options.aliases ?? {}).map(([alias, target]) => [
@@ -1549,14 +1937,16 @@ export default function prefixPrivateMembers(
         aliases,
         cacheKey: JSON.stringify([
             [...accessibility].sort(),
-            prefixPublicMethods,
+            prefixPublicMembers,
             [...excludeClasses].sort(),
             [...excludeMembers].sort(),
+            [...excludeFunctions].sort(),
             Object.entries(aliases).sort(),
         ]),
         excludeClasses,
+        excludeFunctions,
         excludeMembers,
-        prefixPublicMethods,
+        prefixPublicMembers,
     };
 
     // A name that already starts with the prefix is left alone, so that the
@@ -1656,9 +2046,16 @@ export default function prefixPrivateMembers(
 
     // Renames the keys of the object literals passed to a method, going by
     // the keys of the object patterns among its parameters.
+    // Renames the keys of the object literals passed to a method or function,
+    // going by the keys of the object patterns among its parameters. An
+    // object that is not a literal cannot follow the parameter, and the call
+    // would break: when the callee is known for certain, that is an error to
+    // fix in the source or the options.
     const renameArgumentKeys = (
         callArguments: t.Node[],
-        decision: MemberDecision | undefined,
+        decision: FunctionDecision | MemberDecision | null | undefined,
+        certain: boolean,
+        describe: () => string,
     ): void => {
         if (!prefixParameterKeys || !decision?.renamed) {
             return;
@@ -1667,15 +2064,24 @@ export default function prefixPrivateMembers(
         decision.parameterKeys?.forEach((keys, index) => {
             const argument = callArguments[index];
 
-            if (keys != null && argument?.type === "ObjectExpression") {
-                renameObjectKeys(argument, keys);
+            if (keys == null || argument == null) {
+                return;
+            }
+
+            if (isPlainObjectLiteral(argument)) {
+                renameObjectKeys(argument as t.ObjectExpression, keys);
+            } else if (certain) {
+                throw new Error(
+                    `prefix-private-members: ${describe()} passes an object that is not a literal to a parameter whose keys are prefixed (${keys.join(", ")}). Pass an object literal, or exclude the class, member or function.`,
+                );
             }
         });
     };
 
-    // Renames the keys of the object patterns among a method's parameters.
+    // Renames the keys of the object patterns among the parameters of a
+    // method or function.
     const renameParameterKeys = (
-        member: t.ClassMethod | t.TSDeclareMethod,
+        member: t.Function | t.TSDeclareMethod,
     ): void => {
         for (const parameter of member.params) {
             const pattern = getObjectPattern(parameter);
@@ -2029,26 +2435,74 @@ export default function prefixPrivateMembers(
             }
         };
 
+        // The decision about the function a call by name reaches: declared in
+        // this file, or imported from another project file.
+        const getFunctionCallDecision = (
+            callee: NodePath<t.Identifier>,
+        ): FunctionDecision | null => {
+            const { name } = callee.node;
+            const binding = callee.scope.getBinding(name);
+
+            if (!binding) {
+                return null;
+            }
+
+            const declared = getDeclaredFunction(binding.path.node);
+
+            if (declared) {
+                return context.localFunctions.get(declared.fn) ?? null;
+            }
+
+            if (binding.kind !== "module" || filename == null) {
+                return null;
+            }
+
+            const classSource = findClassSource(programNode, name);
+
+            if (!classSource || "classNode" in classSource) {
+                return null;
+            }
+
+            const source = resolveModule(
+                classSource.source,
+                filename,
+                baseClassOptions.aliases,
+            );
+
+            return source
+                ? getExportedFunctionDecision(
+                      source,
+                      classSource.exportName,
+                      baseClassOptions,
+                      new Set(),
+                  )
+                : null;
+        };
+
         // The decision about `object.x`: by the object's type when known,
         // else, in "all" mode, by the name alone.
         const getReferenceDecision = (
             path: NodePath<PropertyAccess>,
-        ): MemberDecision | undefined => {
+        ): { byType: boolean; decision: MemberDecision | undefined } => {
             const name = getPropertyName(path.node);
 
             if (name == null) {
-                return undefined;
+                return { byType: false, decision: undefined };
             }
 
             const decisions = getObjectDecisions(path, new Set());
 
             return decisions
-                ? decisions.get(name)
-                : context.allDecisions?.get(name);
+                ? { byType: true, decision: decisions.get(name) }
+                : { byType: false, decision: context.allDecisions?.get(name) };
         };
 
+        // Where a call is, for an error message.
+        const describeCall = (node: t.Node, callee: string): string =>
+            `${callee} at ${filename ?? "<unknown>"}:${node.loc?.start.line ?? "?"}`;
+
         const rewriteMember = (path: NodePath<PropertyAccess>) => {
-            const decision = getReferenceDecision(path);
+            const { decision } = getReferenceDecision(path);
             const name = getPropertyName(path.node);
             const newName =
                 decision?.renamed && name != null ? getNewName(name) : null;
@@ -2065,7 +2519,9 @@ export default function prefixPrivateMembers(
             path: NodePath<t.CallExpression | t.OptionalCallExpression>,
         ) => {
             const callee = path.get("callee");
-            let decision: MemberDecision | undefined;
+            let decision: FunctionDecision | MemberDecision | null | undefined;
+            let certain = true;
+            let calleeName = "a call";
 
             if (callee.isSuper()) {
                 const classPath = getThisClass(path);
@@ -2075,17 +2531,27 @@ export default function prefixPrivateMembers(
                           .get(classPath.node)
                           ?.get(CONSTRUCTOR)
                     : undefined;
+                calleeName = "super(...)";
             } else if (
                 callee.isMemberExpression() ||
                 callee.isOptionalMemberExpression()
             ) {
-                decision = getReferenceDecision(callee);
+                const reference = getReferenceDecision(callee);
+
+                decision = reference.decision;
+                certain = reference.byType;
+                calleeName = `.${getPropertyName(callee.node) ?? "?"}(...)`;
+            } else if (callee.isIdentifier()) {
+                decision = getFunctionCallDecision(callee);
+                calleeName = `${callee.node.name}(...)`;
             }
 
-            const callArguments = path.node.arguments;
+            const callNode = path.node;
 
             rewrites.push(() => {
-                renameArgumentKeys(callArguments, decision);
+                renameArgumentKeys(callNode.arguments, decision, certain, () =>
+                    describeCall(callNode, calleeName),
+                );
             });
         };
 
@@ -2097,7 +2563,7 @@ export default function prefixPrivateMembers(
             }
 
             const ref = resolveName(callee.name);
-            const callArguments = path.node.arguments;
+            const callNode = path.node;
 
             if (ref) {
                 const decision = getClassRefDecisions(ref, context).get(
@@ -2105,7 +2571,9 @@ export default function prefixPrivateMembers(
                 );
 
                 rewrites.push(() => {
-                    renameArgumentKeys(callArguments, decision);
+                    renameArgumentKeys(callNode.arguments, decision, true, () =>
+                        describeCall(callNode, `new ${callee.name}(...)`),
+                    );
                 });
             }
         };
@@ -2171,10 +2639,38 @@ export default function prefixPrivateMembers(
                     }
                 }
 
+                // The named functions of the file, for the keys of their
+                // object parameters.
+                const localFunctions = new Map<
+                    NamedFunction,
+                    FunctionDecision
+                >();
+
+                if (prefixParameterKeys) {
+                    programPath.traverse({
+                        "FunctionDeclaration|VariableDeclarator"(path) {
+                            const declared = getDeclaredFunction(path.node);
+
+                            if (declared) {
+                                localFunctions.set(
+                                    declared.fn,
+                                    getFunctionDecision(
+                                        declared.fn,
+                                        declared.name,
+                                        programNode,
+                                        baseClassOptions,
+                                    ),
+                                );
+                            }
+                        },
+                    });
+                }
+
                 const rewrites = planReferenceRewrites(programPath, {
                     allDecisions: rewriteAll ? allDecisions : null,
                     filename,
                     localDecisions,
+                    localFunctions,
                     localInherited,
                     programNode,
                 });
@@ -2184,6 +2680,12 @@ export default function prefixPrivateMembers(
 
                     if (decisions) {
                         renameDeclarations(classPath, decisions);
+                    }
+                }
+
+                for (const [fn, decision] of localFunctions) {
+                    if (decision.renamed) {
+                        renameParameterKeys(fn);
                     }
                 }
 

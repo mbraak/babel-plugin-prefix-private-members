@@ -473,18 +473,21 @@ describe("prefix-private-members", () => {
         expect(code).toContain("this._container.remove()");
     });
 
-    it("prefixes public methods with prefixPublicMethods", () => {
+    it("prefixes public members with prefixPublicMembers", () => {
         const code = transform(
             `
                 class Tree {
                     public element: HTMLElement;
                     count = 0;
 
-                    constructor(public options: object) {}
+                    constructor(public options: object) {
+                        this.options = options;
+                    }
 
                     public open(): void {
                         this.render();
                         this.element.focus();
+                        this.count += 1;
                     }
 
                     close(): void {
@@ -502,7 +505,7 @@ describe("prefix-private-members", () => {
                     private render(): void {}
                 }
             `,
-            { prefixPublicMethods: true },
+            { prefixPublicMembers: true },
         );
 
         expect(code).toContain("_open()");
@@ -512,15 +515,17 @@ describe("prefix-private-members", () => {
         expect(code).toContain("static _create()");
         expect(code).toContain("constructor(");
         expect(code).not.toContain("_constructor");
-        expect(code).toContain("this.element.focus()");
-        expect(code).not.toContain("_element");
-        expect(code).not.toContain("_count");
-        expect(code).not.toContain("_options");
-        expect(code).toContain("get size()");
-        expect(code).not.toContain("_size");
+        expect(code).toContain("_element;");
+        expect(code).toContain("this._element.focus()");
+        expect(code).toContain("_count = 0");
+        expect(code).toContain("this._count += 1");
+        expect(code).toContain("constructor(_options)");
+        expect(code).toContain("this._options = _options");
+        expect(code).toContain("get _size()");
+        expect(code).toContain("return this._count");
     });
 
-    it("leaves the public methods of excluded classes alone", () => {
+    it("leaves the public members of excluded classes alone", () => {
         const code = transform(
             `
                 class Tree {
@@ -535,7 +540,7 @@ describe("prefix-private-members", () => {
                     public open(): void {}
                 }
             `,
-            { excludeClasses: ["Tree"], prefixPublicMethods: true },
+            { excludeClasses: ["Tree"], prefixPublicMembers: true },
         );
 
         expect(code).toMatch(/class Tree \{\s*open\(\)/);
@@ -544,7 +549,7 @@ describe("prefix-private-members", () => {
         expect(code).toMatch(/class Node \{\s*_open\(\)/);
     });
 
-    it("leaves public methods alone without prefixPublicMethods", () => {
+    it("leaves public members alone without prefixPublicMembers", () => {
         const code = transform(
             `
                 class Tree {
@@ -558,7 +563,7 @@ describe("prefix-private-members", () => {
         expect(code).not.toContain("_open");
     });
 
-    it("renames an inherited public method of a base class in another file", () => {
+    it("renames inherited public members of a base class in another file", () => {
         const code = transformProject(
             {
                 "base.ts": `
@@ -579,12 +584,12 @@ describe("prefix-private-members", () => {
                 `,
             },
             "sub.ts",
-            { prefixPublicMethods: true },
+            { prefixPublicMembers: true },
         );
 
         expect(code).toContain("_run()");
         expect(code).toContain("this._open()");
-        expect(code).toContain("this.element.focus()");
+        expect(code).toContain("this._element.focus()");
     });
 
     it("renames an override of a renamed base method in an excluded class", () => {
@@ -610,7 +615,7 @@ describe("prefix-private-members", () => {
                 `,
             },
             "sub.ts",
-            { excludeClasses: ["Sub"], prefixPublicMethods: true },
+            { excludeClasses: ["Sub"], prefixPublicMembers: true },
         );
 
         expect(code).toContain("_open()");
@@ -643,7 +648,7 @@ describe("prefix-private-members", () => {
                 `,
             },
             "sub.ts",
-            { excludeClasses: ["Base"], prefixPublicMethods: true },
+            { excludeClasses: ["Base"], prefixPublicMembers: true },
         );
 
         expect(code).toContain("open()");
@@ -665,7 +670,7 @@ describe("prefix-private-members", () => {
                     public setParent(parent: Node): void {}
                 }
             `,
-            { prefixPublicMethods: true },
+            { prefixPublicMembers: true },
         );
 
         expect(code).toContain("node._setParent(this)");
@@ -750,7 +755,7 @@ describe("prefix-private-members", () => {
             {
                 excludeClasses: ["Tree"],
                 prefixParameterKeys: true,
-                prefixPublicMethods: true,
+                prefixPublicMembers: true,
             },
         );
 
@@ -782,7 +787,7 @@ describe("prefix-private-members", () => {
             { excludeClasses: ["Tree"], prefixParameterKeys: true },
         );
 
-        // Without prefixPublicMethods a constructor is public API everywhere.
+        // Without prefixPublicMembers a constructor is public API everywhere.
         expect(code).not.toContain("_element");
     });
 
@@ -827,7 +832,7 @@ describe("prefix-private-members", () => {
             {
                 excludeClasses: ["Tree"],
                 prefixParameterKeys: true,
-                prefixPublicMethods: true,
+                prefixPublicMembers: true,
             },
         );
 
@@ -904,10 +909,225 @@ describe("prefix-private-members", () => {
     });
 });
 
+describe("parameter keys of functions", () => {
+    it("prefixes the keys of a function's object parameter and of its calls", () => {
+        const code = transform(
+            `
+                function add({ left, right }: Params): number {
+                    return left + right;
+                }
+
+                const scale = ({ value, factor = 1 }: ScaleParams) => value * factor;
+
+                add({ left: 1, right: 2 });
+                scale({ value: 3 });
+            `,
+            { prefixParameterKeys: true },
+        );
+
+        expect(code).toMatch(
+            /function add\(\{\s*_left: left,\s*_right: right\s*\}\)/,
+        );
+        expect(code).toMatch(/add\(\{\s*_left: 1,\s*_right: 2\s*\}\)/);
+        expect(code).toMatch(
+            /\(\{\s*_value: value,\s*_factor: factor = 1\s*\}\) =>/,
+        );
+        expect(code).toMatch(/scale\(\{\s*_value: 3\s*\}\)/);
+    });
+
+    it("leaves the keys of a function that is passed as a value alone", () => {
+        const code = transform(
+            `
+                function onClick({ target }: MouseEvent): void {}
+
+                document.addEventListener("click", onClick);
+                onClick({ target: null });
+            `,
+            { prefixParameterKeys: true },
+        );
+
+        expect(code).not.toContain("_target");
+    });
+
+    it("leaves the keys of the functions in excludeFunctions alone", () => {
+        const code = transform(
+            `
+                export function render({ node }: Params): void {}
+
+                render({ node: null });
+            `,
+            { excludeFunctions: ["render"], prefixParameterKeys: true },
+        );
+
+        expect(code).not.toContain("_node");
+    });
+
+    it("leaves the keys of functions alone without prefixParameterKeys", () => {
+        const code = transform(`
+            function render({ node }: Params): void {}
+
+            render({ node: null });
+        `);
+
+        expect(code).not.toContain("_node");
+    });
+
+    it("prefixes the keys of a call to a function in another file", () => {
+        const code = transformProject(
+            {
+                "iterate.ts": `
+                    interface Options {
+                        handleNode: () => void;
+                        handleFolder: () => void;
+                    }
+
+                    const iterate = (tree: Node, { handleNode, handleFolder }: Options) => {};
+
+                    export default iterate;
+                `,
+                "render.ts": `
+                    type Params = { node: Node; level: number };
+
+                    export function render({ node, level }: Params): void {}
+                `,
+                "index.ts": `
+                    import iterate from "./iterate";
+                    import { render } from "./render";
+
+                    const handleNode = () => {};
+
+                    iterate(tree, { handleNode, handleFolder: () => {} });
+                    render({ node, level: 1 });
+                `,
+            },
+            "index.ts",
+            { prefixParameterKeys: true },
+        );
+
+        expect(code).toMatch(
+            /iterate\(tree, \{\s*_handleNode: handleNode,\s*_handleFolder:/,
+        );
+        expect(code).toMatch(/render\(\{\s*_node: node,\s*_level: 1\s*\}\)/);
+    });
+
+    it("keeps the keys of an exported function whose parameter type is exported", () => {
+        const code = transformProject(
+            {
+                "classNames.ts": `
+                    export interface ClassNamesOptions {
+                        classPrefix: string;
+                    }
+
+                    const createClassNames = ({ classPrefix }: ClassNamesOptions) => ({
+                        border: classPrefix + "-border",
+                    });
+
+                    export default createClassNames;
+                `,
+                "index.ts": `
+                    import createClassNames from "./classNames";
+
+                    export class Tree {
+                        private classNames = createClassNames(this.options);
+                        private options: ClassNamesOptions;
+                    }
+                `,
+            },
+            "classNames.ts",
+            { prefixParameterKeys: true },
+        );
+
+        // The options of an exported type can come from anywhere, so the
+        // keys stay.
+        expect(code).not.toContain("_classPrefix");
+    });
+
+    it("keeps the keys of a function called with an object built elsewhere", () => {
+        const code = transform(
+            `
+                function render({ node }: { node: Node }): void {}
+
+                const params = { node: null };
+                render(params);
+                render({ node: null });
+            `,
+            { prefixParameterKeys: true },
+        );
+
+        expect(code).not.toContain("_node");
+    });
+
+    it("rejects a non-literal passed from another file to a prefixed parameter", () => {
+        expect(() =>
+            transformProject(
+                {
+                    "iterate.ts": `
+                        interface Options {
+                            handleNode: () => void;
+                        }
+
+                        export const iterate = ({ handleNode }: Options) => {};
+                    `,
+                    "index.ts": `
+                        import { iterate } from "./iterate";
+
+                        const options = { handleNode: () => {} };
+                        iterate(options);
+                    `,
+                },
+                "index.ts",
+                { prefixParameterKeys: true },
+            ),
+        ).toThrow(
+            /iterate\(\.\.\.\) at .*index\.ts:5 passes an object that is not a literal/,
+        );
+    });
+
+    it("rejects a non-literal passed to a method with prefixed keys", () => {
+        expect(() =>
+            transform(
+                `
+                    class Tree {
+                        public open(params: Params): void {
+                            this.render(params);
+                        }
+
+                        private render({ node }: Params): void {}
+                    }
+                `,
+                { prefixParameterKeys: true },
+            ),
+        ).toThrow(
+            /\.render\(\.\.\.\) at .* passes an object that is not a literal/,
+        );
+    });
+
+    it("keeps the keys of a call to a function another file passes around", () => {
+        const code = transformProject(
+            {
+                "handler.ts": `
+                    export function onClick({ target }: MouseEvent): void {}
+
+                    document.addEventListener("click", onClick);
+                `,
+                "index.ts": `
+                    import { onClick } from "./handler";
+
+                    onClick({ target: null });
+                `,
+            },
+            "index.ts",
+            { prefixParameterKeys: true },
+        );
+
+        expect(code).not.toContain("_target");
+    });
+});
+
 describe("following types", () => {
     const publicOptions: Options = {
         excludeClasses: ["Tree"],
-        prefixPublicMethods: true,
+        prefixPublicMembers: true,
     };
 
     it("rewrites a call through a member typed with a class in another file", () => {

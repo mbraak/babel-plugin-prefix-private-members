@@ -2,11 +2,14 @@
 
 ## Unreleased
 
-- `prefixPublicMethods` option: also rename the public methods of every class,
+- `prefixPublicMembers` option: also rename the public members of every class,
   except the classes listed in `excludeClasses`.
 - `prefixParameterKeys` option: also rename the keys of the object pattern
-  parameters of renamed methods and constructors, and of the object literals
-  passed to them.
+  parameters of renamed methods, constructors and functions, and of the
+  object literals passed to them. `excludeFunctions` lists the functions to
+  leave alone.
+- A call that passes something other than an object literal to a prefixed
+  parameter is a build error, naming the call.
 - References through other objects are rewritten when the object's type is
   known from an annotation: typed members, parameters and variables, `new`,
   method and function return types, casts, arrays, destructured parameters

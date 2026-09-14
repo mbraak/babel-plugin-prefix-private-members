@@ -84,10 +84,11 @@ safe to run over source that is already prefixed by hand.
 | `memberAccess`        | `"this"`                   | `"this"` rewrites `this.x` and `super.x` only. `"all"` rewrites every `<expr>.x` in the file, see below. |
 | `aliases`             | `{}`                       | Import prefix to directory, for non-relative imports that are project files: `{ "app/": "./src/" }`.     |
 | `root`                | `process.cwd()`            | What `aliases` are resolved against.                                                                     |
-| `prefixPublicMethods` | `false`                    | Also rename the public methods of every class not in `excludeClasses`, see below.                        |
-| `excludeClasses`      | `[]`                       | Classes whose public methods keep their names.                                                           |
+| `prefixPublicMembers` | `false`                    | Also rename the public members of every class not in `excludeClasses`, see below.                        |
+| `excludeClasses`      | `[]`                       | Classes whose public members keep their names.                                                           |
 | `excludeMembers`      | `[]`                       | Member names that are never renamed, in any class.                                                       |
-| `prefixParameterKeys` | `false`                    | Also rename the keys of object parameters of renamed methods and constructors, see below.                |
+| `excludeFunctions`    | `[]`                       | Functions whose object parameter keys `prefixParameterKeys` leaves alone.                                |
+| `prefixParameterKeys` | `false`                    | Also rename the keys of object parameters of renamed methods, constructors and functions, see below.     |
 
 ```json
 {
@@ -100,19 +101,19 @@ safe to run over source that is already prefixed by hand.
 }
 ```
 
-## Prefixing public methods
+## Prefixing public members
 
-Inside a library, most classes are internal, and their public methods are
-public only to the other files of the library. `prefixPublicMethods: true`
-renames those too, and `excludeClasses` lists the classes whose public methods
-are the actual API.
+Inside a library, most classes are internal, and their public members are
+public only to the other files of the library. `prefixPublicMembers: true`
+renames those too, methods and properties alike, and `excludeClasses` lists
+the classes whose public members are the actual API.
 
 ```json
 {
     "plugins": [
         [
             "prefix-private-members",
-            { "prefixPublicMethods": true, "excludeClasses": ["Tree"] }
+            { "prefixPublicMembers": true, "excludeClasses": ["Tree"] }
         ]
     ]
 }
@@ -125,16 +126,16 @@ export class Tree {
 }
 
 class Node {
-    public element: HTMLElement; //  ->  element (a property)
+    public element: HTMLElement; //  ->  _element
     public setParent(parent: Node) {} //  ->  _setParent
 }
 ```
 
-Only methods are renamed, with or without a `public` modifier. Properties,
-getters and setters keep their names. A subclass follows its base classes: a
-method that is renamed in the base class is renamed in the subclass too, and a
-public method that an excluded base class keeps stays in the subclass as well,
-so overrides keep working.
+Every public member is renamed, with or without a `public` modifier: methods,
+properties, getters and setters, statics and parameter properties. A subclass
+follows its base classes: a member that is renamed in the base class is renamed
+in the subclass too, and a public member that an excluded base class keeps
+stays in the subclass as well, so overrides keep working.
 
 A method that implements a member of an interface named in the class's
 `implements` clause keeps its name too: an object typed with the interface is
@@ -159,9 +160,9 @@ class Tree {
 }
 ```
 
-Constructors follow the public methods: the keys of a constructor's object
+Constructors follow the public members: the keys of a constructor's object
 parameter are renamed when the class is not in `excludeClasses` and
-`prefixPublicMethods` is on, or when the constructor is `private` or
+`prefixPublicMembers` is on, or when the constructor is `private` or
 `protected`. The literals passed to `super(...)` and to `new X(...)` are
 rewritten as well, also when `X` is imported from another project file:
 
@@ -171,10 +172,34 @@ import MouseHandler from "./mouseHandler";
 new MouseHandler({ element, onClick }); //  ->  new MouseHandler({ _element: element, _onClick: onClick })
 ```
 
+Functions get the same treatment: a function declaration, or a variable
+holding an arrow or function expression, has the keys of its object pattern
+parameters renamed, along with the literals at its calls, whether the call is
+in the same file or reaches it through an import. `excludeFunctions` lists the
+functions that are public API.
+
+A function only qualifies when the objects it receives are written at its
+calls. In its own file, every use must be a direct call passing an object
+literal without spread, so a function passed as a callback or called with a
+variable keeps its keys. A function that is exported must also type its object
+parameters with a type literal or an interface or alias that is not exported:
+an object of an exported type, like the options a library user passes in, can
+come from anywhere. A call from another file that still passes something other
+than a literal to a prefixed parameter is a build error naming the call, since
+the parameter has already been renamed in its own file; the same holds for
+methods and constructors called with a variable.
+
+```ts
+const iterate = (tree: Node, { handleNode }: Options) => {}; //  ->  { _handleNode: handleNode }
+
+iterate(tree, { handleNode }); //  ->  iterate(tree, { _handleNode: handleNode })
+```
+
 Only the literal written at the call is rewritten. An object built elsewhere
 and passed as a variable, a spread, a nested object, or a parameter typed as
 an object without destructuring (`params: Params` with `params.node`) is not
-followed. The calls themselves are found as described next.
+followed. Method calls are found as described next; function calls by the
+name they are called with.
 
 ## How references are found
 
