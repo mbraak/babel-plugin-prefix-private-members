@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 - `prefixPublicMembers` option: also rename the public members of every class,
   except the classes listed in `excludeClasses`.
