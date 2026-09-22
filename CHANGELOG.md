@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0
 
 - The plugin now asks the TypeScript type checker what every `object.x`
   refers to, instead of reading type annotations itself. References are
