@@ -18,7 +18,7 @@ const transform = (
         babelrc: false,
         configFile: false,
         filename,
-        plugins: [[prefixPrivateMembers, options]],
+        plugins: [[prefixPrivateMembers, { tsconfig: false, ...options }]],
         presets: [
             ["@babel/preset-typescript", { onlyRemoveTypeImports: true }],
         ],
@@ -292,19 +292,16 @@ describe("prefix-private-members", () => {
         expect(code).toContain("options.render()");
     });
 
-    it("rewrites access to another instance with memberAccess all", () => {
-        const code = transform(
-            `
-                class Node {
-                    public addChild(node: Node): void {
-                        node.setParent(this);
-                    }
-
-                    private setParent(parent: Node): void {}
+    it("rewrites access to another instance of the class", () => {
+        const code = transform(`
+            class Node {
+                public addChild(node: Node): void {
+                    node.setParent(this);
                 }
-            `,
-            { memberAccess: "all" },
-        );
+
+                private setParent(parent: Node): void {}
+            }
+        `);
 
         expect(code).toContain("node._setParent(this)");
     });
@@ -341,22 +338,6 @@ describe("prefix-private-members", () => {
         expect(code).toContain("_render()");
         expect(code).toContain("draw()");
         expect(code).not.toContain("_draw()");
-    });
-
-    it("rewrites access to another instance after the file directive", () => {
-        const code = transform(`
-            // prefix-private-members: all
-
-            class Node {
-                public addChild(node: Node): void {
-                    node.setParent(this);
-                }
-
-                private setParent(parent: Node): void {}
-            }
-        `);
-
-        expect(code).toContain("node._setParent(this)");
     });
 
     it("prefixes members inherited from a base class in another file", () => {
@@ -657,11 +638,9 @@ describe("prefix-private-members", () => {
         expect(code).toContain("_run()");
     });
 
-    it("renames an inherited public method with the file directive", () => {
+    it("renames a public method called on another instance", () => {
         const code = transform(
             `
-                // prefix-private-members: all
-
                 class Node {
                     public addChild(node: Node): void {
                         node.setParent(this);
@@ -868,7 +847,7 @@ describe("prefix-private-members", () => {
         expect(code).toMatch(/super\._render\(\{\s*_node: node\s*\}\)/);
     });
 
-    it("prefixes the keys passed to another instance with memberAccess all", () => {
+    it("prefixes the keys passed to another instance", () => {
         const code = transform(
             `
                 class Node {
@@ -879,7 +858,7 @@ describe("prefix-private-members", () => {
                     private setParent({ parent }: Params): void {}
                 }
             `,
-            { memberAccess: "all", prefixParameterKeys: true },
+            { prefixParameterKeys: true },
         );
 
         expect(code).toMatch(/node\._setParent\(\{\s*_parent: this\s*\}\)/);
@@ -900,12 +879,6 @@ describe("prefix-private-members", () => {
         );
 
         expect(code).not.toContain("__node");
-    });
-
-    it("rejects an unknown memberAccess option", () => {
-        expect(() =>
-            transform("class Tree {}", { memberAccess: "nope" }),
-        ).toThrow(/memberAccess/);
     });
 });
 
@@ -1433,6 +1406,149 @@ describe("following types", () => {
 
         expect(code).not.toContain("_toString");
         expect(code).not.toContain("_toJSON");
+    });
+
+    it("rewrites a call through a union of project classes", () => {
+        const code = transform(
+            `
+                class Handler {
+                    public run(): void {}
+                }
+
+                class Special extends Handler {
+                    public run(): void {}
+                }
+
+                function start(handler: Handler | Special | null): void {
+                    handler?.run();
+                }
+            `,
+            publicOptions,
+        );
+
+        expect(code).toContain("handler?._run()");
+    });
+
+    it("rewrites a call through a generic", () => {
+        const code = transform(
+            `
+                class Handler {
+                    public run(): void {}
+                }
+
+                class Box<T> {
+                    constructor(public value: T) {}
+                }
+
+                function start(box: Box<Handler>): void {
+                    box.value.run();
+                    const { value } = box;
+                    value.run();
+                }
+            `,
+            publicOptions,
+        );
+
+        expect(code).toContain("box._value._run()");
+        expect(code).toContain("value._run()");
+    });
+
+    it("rewrites a call through an inferred callback parameter", () => {
+        const code = transform(
+            `
+                class Handler {
+                    public run(): void {}
+                }
+
+                class Tree {
+                    private handlers: Handler[] = [];
+
+                    public start(): void {
+                        this.handlers.forEach((handler) => handler.run());
+                        this.handlers.find((handler) => handler !== null)?.run();
+                    }
+                }
+            `,
+            publicOptions,
+        );
+
+        expect(code).toContain("handler => handler._run()");
+        expect(code).toContain("?._run()");
+    });
+
+    it("keeps a member that a base class from outside the project has", () => {
+        const code = transform(
+            `
+                class Widget extends HTMLElement {
+                    public focus(): void {
+                        this.render();
+                    }
+
+                    public render(): void {
+                        this.focus();
+                    }
+                }
+            `,
+            { prefixPublicMembers: true },
+        );
+
+        expect(code).toContain("this.focus()");
+        expect(code).not.toContain("_focus");
+        expect(code).toContain("this._render()");
+    });
+
+    it("rejects a reference through a union that disagrees about the name", () => {
+        expect(() =>
+            transform(
+                `
+                    class Handler {
+                        public run(): void {}
+                    }
+
+                    interface Runnable {
+                        run(): void;
+                    }
+
+                    function start(x: Handler | Runnable): void {
+                        x.run();
+                    }
+                `,
+                publicOptions,
+            ),
+        ).toThrow(/"run" at .*test\.ts:11 refers to a member that is prefixed/);
+    });
+
+    it("resolves imports with the paths of the project's tsconfig", () => {
+        const code = transformProject(
+            {
+                "lib/base.ts": `
+                    export default class Base {
+                        protected container: HTMLElement;
+                    }
+                `,
+                "sub.ts": `
+                    import Base from "app/base";
+
+                    export class Sub extends Base {
+                        public clear(): void {
+                            this.container.remove();
+                        }
+                    }
+                `,
+                "tsconfig.json": JSON.stringify({
+                    compilerOptions: {
+                        module: "ESNext",
+                        moduleResolution: "bundler",
+                        paths: { "app/*": ["./lib/*"] },
+                        strict: true,
+                    },
+                }),
+            },
+            "sub.ts",
+            { tsconfig: "tsconfig.json" },
+        );
+
+        expect(code).toContain("this._container.remove()");
     });
 
     it("keeps the members in excludeMembers", () => {

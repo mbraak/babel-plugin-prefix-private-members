@@ -50,7 +50,8 @@
         "tsc": "tsc --noEmit --project tsconfig.json"
     },
     "peerDependencies": {
-        "@babel/core": "^8.0.0"
+        "@babel/core": "^8.0.0",
+        "typescript": ">=5.0.0"
     },
     "devDependencies": {
         "@babel/core": "^8.0.0",

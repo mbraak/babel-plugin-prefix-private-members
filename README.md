@@ -1,7 +1,8 @@
 # babel-plugin-prefix-private-members
 
 Babel plugin that prefixes TypeScript `private` and `protected` class members
-with `_`, and rewrites the `this.` / `super.` references to them.
+with `_`, and rewrites the references to them, using the TypeScript type
+checker to find them.
 
 Pair it with a minifier that mangles properties matching the prefix, and every
 private member is renamed to a short name in the production bundle. The prefix
@@ -26,7 +27,8 @@ class Tree {
 pnpm add -D babel-plugin-prefix-private-members
 ```
 
-Requires `@babel/core` 8 and Node 20 or newer. The package is ESM only.
+Requires `@babel/core` 8, `typescript` 5 or newer and Node 20 or newer. The
+package is ESM only.
 
 ## Usage
 
@@ -54,41 +56,47 @@ The plugin must run while the TypeScript accessibility modifiers are still in
 the AST, so put it in the same Babel pass as `@babel/preset-typescript` (plugins
 run before presets, so the order above is right).
 
+The plugin type checks each file together with the files it imports, with the
+compiler options of the nearest `tsconfig.json`. One TypeScript program per
+project is kept for the lifetime of the process, so a watch mode pays for the
+type checker once.
+
 ## What gets renamed
 
 - `private` and `protected` properties, methods, getters, setters, static
   members, abstract declarations and `accessor` fields.
 - Parameter properties: `constructor(private element: HTMLElement)` renames the
   member and the parameter binding in the constructor body.
-- References to the renamed members: `this.x` and `super.x`, and `node.x`
-  wherever the type of `node` is known from an annotation, see
+- References to the renamed members: `this.x`, `super.x`, and `node.x`
+  wherever the type checker knows what `node` is, see
   [How references are found](#how-references-are-found).
-- Members inherited from a base class: when a class extends a class imported
-  over a relative path or a configured alias, that file is parsed and its
-  private/protected member names are renamed in the subclass too, recursively
-  up the whole chain. `extends HTMLElement` and classes from packages are left
-  alone.
+- Members inherited from a base class: when a class extends a class declared
+  in another project file, the private/protected member names of that class
+  are renamed in the subclass too, recursively up the whole chain. The
+  imports are resolved as the project's `tsconfig.json` says, `paths`
+  included.
 
 Not renamed: public members, members without a modifier, constructors, computed
 keys, the methods of the built-in protocols (`toString`, `valueOf`, `toJSON`,
-`then`, the custom element callbacks), the names in `excludeMembers`, and
-anything already starting with the prefix. The plugin is idempotent, so it is
-safe to run over source that is already prefixed by hand.
+`then`, the custom element callbacks), the names in `excludeMembers`, members
+that a base class from outside the project already has (`HTMLElement.focus`),
+and anything already starting with the prefix. The plugin is idempotent, so it
+is safe to run over source that is already prefixed by hand.
 
 ## Options
 
-| Option                | Default                    | Description                                                                                              |
-| --------------------- | -------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `prefix`              | `"_"`                      | Prefix to add.                                                                                           |
-| `accessibility`       | `["private", "protected"]` | Which modifiers to rename.                                                                               |
-| `memberAccess`        | `"this"`                   | `"this"` rewrites `this.x` and `super.x` only. `"all"` rewrites every `<expr>.x` in the file, see below. |
-| `aliases`             | `{}`                       | Import prefix to directory, for non-relative imports that are project files: `{ "app/": "./src/" }`.     |
-| `root`                | `process.cwd()`            | What `aliases` are resolved against.                                                                     |
-| `prefixPublicMembers` | `false`                    | Also rename the public members of every class not in `excludeClasses`, see below.                        |
-| `excludeClasses`      | `[]`                       | Classes whose public members keep their names.                                                           |
-| `excludeMembers`      | `[]`                       | Member names that are never renamed, in any class.                                                       |
-| `excludeFunctions`    | `[]`                       | Functions whose object parameter keys `prefixParameterKeys` leaves alone.                                |
-| `prefixParameterKeys` | `false`                    | Also rename the keys of object parameters of renamed methods, constructors and functions, see below.     |
+| Option                | Default                    | Description                                                                                          |
+| --------------------- | -------------------------- | ---------------------------------------------------------------------------------------------------- |
+| `prefix`              | `"_"`                      | Prefix to add.                                                                                       |
+| `accessibility`       | `["private", "protected"]` | Which modifiers to rename.                                                                           |
+| `root`                | `process.cwd()`            | Where the `tsconfig.json` search starts, and what `aliases` are resolved against.                    |
+| `tsconfig`            | nearest `tsconfig.json`    | The tsconfig to take the compiler options from, relative to `root`. `false` for built-in defaults.   |
+| `aliases`             | `{}`                       | Import prefix to directory, added to the `paths` of the compiler options: `{ "app/": "./src/" }`.    |
+| `prefixPublicMembers` | `false`                    | Also rename the public members of every class not in `excludeClasses`, see below.                    |
+| `excludeClasses`      | `[]`                       | Classes whose public members keep their names.                                                       |
+| `excludeMembers`      | `[]`                       | Member names that are never renamed, in any class.                                                   |
+| `excludeFunctions`    | `[]`                       | Functions whose object parameter keys `prefixParameterKeys` leaves alone.                            |
+| `prefixParameterKeys` | `false`                    | Also rename the keys of object parameters of renamed methods, constructors and functions, see below. |
 
 ```json
 {
@@ -139,8 +147,8 @@ stays in the subclass as well, so overrides keep working.
 
 A method that implements a member of an interface named in the class's
 `implements` clause keeps its name too: an object typed with the interface is
-how it is called. Methods called through an object whose type the plugin cannot
-read (see below) need their class in `excludeClasses`, or their name in
+how it is called. Methods called through an object whose type the checker does
+not know (see below) need their class in `excludeClasses`, or their name in
 `excludeMembers`.
 
 ## Prefixing the keys of object parameters
@@ -198,59 +206,44 @@ iterate(tree, { handleNode }); //  ->  iterate(tree, { _handleNode: handleNode }
 Only the literal written at the call is rewritten. An object built elsewhere
 and passed as a variable, a spread, a nested object, or a parameter typed as
 an object without destructuring (`params: Params` with `params.node`) is not
-followed. Method calls are found as described next; function calls by the
-name they are called with.
+followed. Which method, constructor or function a call reaches is what the
+type checker resolves it to.
 
 ## How references are found
 
-A reference `object.x` is rewritten when the plugin knows which class `object`
-is an instance of. It reads the type annotations in the source for that, with
-no type checker involved:
-
-- `this` and `super` are the enclosing class, except inside a nested non-arrow
-  function, whose `this` is something else.
-- A member: `this.handler.x` follows the declared type of `handler`, in this
-  class or a base class, and `this.getHandler().x` the return type of the
-  method or getter. A method without a return type that returns `new X(...)`
-  counts as returning `X`.
-- A variable or parameter: its annotation (`node: Node`), its initializer
-  (`new Node()`, or any expression the plugin can type), the array it is taken
-  from in a `for...of` or an index (`nodes[0]`), or, for a destructured
-  parameter `{ node }: Params`, the `node` property of the interface or type
-  literal.
-- A class used as a value: `Handler.create()` for static members.
-- A cast: `(x as Node).y`.
-- A call to a function declared in the file, by its return type.
-
-Types are read as `Node`, `Node | null`, `Node[]`, `Array<Node>`,
-`readonly Node[]`, `() => Node`, and type aliases and interfaces of those,
-declared in the same file or imported from another project file. Classes from
-packages, union types, generics and anything inferred rather than annotated
-are not followed: such an object is left alone, and a method reached only
-through it must be excluded, or renamed by name as described next.
-
-### Renaming by name
-
-Where the type is unknown, a comment anywhere in the file asks the plugin to
-rename every `<expr>.x` in that file whose name is renamed in that same file:
+The plugin runs the TypeScript type checker over the file and the files it
+imports, and asks it what every `object.x` refers to. A reference is rewritten
+when it resolves to a member of a class in a project file, whatever the path
+there: `this` and `super`, a typed variable or parameter, a union, a generic,
+the result of a call, the element of an array, the parameter of a callback, a
+destructured value, a cast.
 
 ```ts
-// prefix-private-members: all
-
 class Node {
-    public addChild(node): void {
+    public addChild(node: Node): void {
         node.setParent(this); //  ->  node._setParent(this)
+        this.children.forEach((child) => child.render()); //  ->  child._render()
     }
 
     private setParent(parent: Node): void {}
+    private render(): void {}
 }
 ```
 
-It is per file rather than the default because member names are not unique:
-`document.createElement()` in a file that declares a `private createElement()`
-would be renamed too, and break. Objects whose type is known are still
-rewritten by type in that mode. Setting the `memberAccess: "all"` option turns
-this on for every file.
+A reference is left alone when the checker does not know its type: an `any`,
+an implicit any, an import that does not resolve, or `this` inside a nested
+`function` that binds its own `this`. A reference through a union whose members
+disagree, a class that renames the member and an interface that keeps it, is a
+build error naming the reference: give the object one type, or exclude the
+member.
+
+The compiler options come from the nearest `tsconfig.json` above `root`, or
+the one named by the `tsconfig` option, so module resolution, `paths` and
+`lib` are the project's own. `tsconfig: false` uses built-in defaults: strict,
+ESNext, bundler module resolution. Every file is treated as a module, as Babel
+does, and `.js` files are included. Project files are the files that are not
+in `node_modules` and not lib files; classes from packages are never renamed,
+and neither are members inherited from them.
 
 ## Development
 

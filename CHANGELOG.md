@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- The plugin now asks the TypeScript type checker what every `object.x`
+  refers to, instead of reading type annotations itself. References are
+  rewritten through unions, generics, inferred types, callback parameters and
+  anything else the checker can type. `typescript` is a peer dependency.
+- The compiler options come from the project's tsconfig.json (`tsconfig`
+  option), so module resolution and `paths` are the project's own. `aliases`
+  is still accepted and added to `paths`.
+- A member that a base class from outside the project already has
+  (`HTMLElement.focus`) is no longer renamed. A method that implements a
+  member of an interface from a package keeps its name too.
+- A reference through a union whose members disagree about the renaming is a
+  build error, naming the reference.
+- Removed: the `memberAccess` option and the `prefix-private-members: all`
+  file directive. Objects of a known type are followed as a matter of course,
+  and a `<expr>.x` whose type is unknown is never renamed by name alone.
+
 ## 0.2.0
 
 - `prefixPublicMembers` option: also rename the public members of every class,
