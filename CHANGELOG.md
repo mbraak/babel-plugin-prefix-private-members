@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.1
 
 - Fix: the members of a class declared in a package (a `.d.ts` in
   `node_modules`) were renamed at their call sites with
