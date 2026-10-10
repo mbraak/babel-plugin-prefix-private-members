@@ -1219,6 +1219,12 @@ export default function prefixPrivateMembers(
                     isStatic: boolean,
                     seen: Set<ts.ClassLikeDeclaration>,
                 ): boolean | null => {
+                    // A class from a package or a lib file: its code is not
+                    // rewritten, so the members keep their names.
+                    if (!isProjectFile(classNode.getSourceFile())) {
+                        return false;
+                    }
+
                     const base = getBaseClass(classNode);
 
                     if (base && "classNode" in base) {
@@ -1309,10 +1315,36 @@ export default function prefixPrivateMembers(
                 const decideReference = (
                     nameNode: ts.Node,
                     name: string,
-                ): boolean => {
-                    const declarations =
+                ): boolean =>
+                    decideDeclarations(
                         checker.getSymbolAtLocation(nameNode)?.declarations ??
-                        [];
+                            [],
+                        nameNode,
+                        name,
+                    );
+
+                // Whether the member that a key of an object pattern takes
+                // is renamed: `const { renderer } = this`. The type of the
+                // destructured object tells which member that is.
+                const decidePatternKey = (
+                    objectType: ts.Type,
+                    nameNode: ts.Node,
+                    name: string,
+                ): boolean => {
+                    const property = objectType.getProperty(name);
+
+                    return decideDeclarations(
+                        property?.declarations ?? [],
+                        nameNode,
+                        name,
+                    );
+                };
+
+                const decideDeclarations = (
+                    declarations: ts.Declaration[],
+                    nameNode: ts.Node,
+                    name: string,
+                ): boolean => {
                     const renamed = declarations.filter(decideDeclaration);
 
                     if (renamed.length === 0) {
@@ -1357,6 +1389,7 @@ export default function prefixPrivateMembers(
                     constructor: ts.ConstructorDeclaration,
                 ): boolean =>
                     ts.isClassLike(constructor.parent) &&
+                    isProjectFile(constructor.getSourceFile()) &&
                     isRenamedMember(
                         CONSTRUCTOR,
                         getAccessibility(constructor),
@@ -1383,15 +1416,17 @@ export default function prefixPrivateMembers(
                     const parameterKeys = getTsParameterKeys(fn);
                     const name = getFunctionName(fn);
 
+                    const file = fn.getSourceFile();
+
                     if (
                         parameterKeys == null ||
                         name == null ||
-                        excludeFunctions.has(name)
+                        excludeFunctions.has(name) ||
+                        !isProjectFile(file)
                     ) {
                         return { parameterKeys, renamed: false };
                     }
 
-                    const file = fn.getSourceFile();
                     const use = analyzeFunctionUse(fn, name, file);
 
                     return {
@@ -1628,6 +1663,77 @@ export default function prefixPrivateMembers(
                     }
                 };
 
+                // The type of the object that a pattern destructures: a
+                // binding pattern (`const { a } = this`) or the target of a
+                // destructuring assignment (`({ a } = this)`).
+                const getPatternObjectType = (
+                    pattern: t.ObjectPattern,
+                ): ts.Type | null => {
+                    const bindingPattern = findTsNode(
+                        pattern,
+                        ts.isObjectBindingPattern,
+                    );
+
+                    if (bindingPattern) {
+                        return checker.getTypeAtLocation(bindingPattern);
+                    }
+
+                    const literal = findTsNode(
+                        pattern,
+                        ts.isObjectLiteralExpression,
+                    );
+                    const parent = literal?.parent;
+
+                    if (
+                        parent &&
+                        ts.isBinaryExpression(parent) &&
+                        parent.operatorToken.kind ===
+                            ts.SyntaxKind.EqualsToken &&
+                        parent.left === literal
+                    ) {
+                        return checker.getTypeAtLocation(parent.right);
+                    }
+
+                    return null;
+                };
+
+                const planPattern = (pattern: t.ObjectPattern): void => {
+                    const objectType = getPatternObjectType(pattern);
+
+                    if (!objectType) {
+                        return;
+                    }
+
+                    const keys: string[] = [];
+
+                    for (const property of pattern.properties) {
+                        if (
+                            property.type !== "ObjectProperty" ||
+                            property.computed
+                        ) {
+                            continue;
+                        }
+
+                        const name = getName(property.key);
+                        const nameNode = findTsName(property.key);
+
+                        if (
+                            name != null &&
+                            nameNode != null &&
+                            getNewName(name) != null &&
+                            decidePatternKey(objectType, nameNode, name)
+                        ) {
+                            keys.push(name);
+                        }
+                    }
+
+                    if (keys.length > 0) {
+                        rewrites.push(() => {
+                            renameObjectKeys(pattern, keys);
+                        });
+                    }
+                };
+
                 const planCall = (
                     path: NodePath<
                         | t.CallExpression
@@ -1684,6 +1790,9 @@ export default function prefixPrivateMembers(
                     },
                     "MemberExpression|OptionalMemberExpression"(path) {
                         planMember(path);
+                    },
+                    ObjectPattern(path) {
+                        planPattern(path.node);
                     },
                     "CallExpression|OptionalCallExpression|NewExpression"(
                         path,

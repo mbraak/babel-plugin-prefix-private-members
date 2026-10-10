@@ -70,6 +70,9 @@ type checker once.
 - References to the renamed members: `this.x`, `super.x`, and `node.x`
   wherever the type checker knows what `node` is, see
   [How references are found](#how-references-are-found).
+- Keys of object patterns that destructure a class instance:
+  `const { container } = this` becomes `const { _container: container } = this`,
+  also in destructuring assignments and nested patterns.
 - Members inherited from a base class: when a class extends a class declared
   in another project file, the private/protected member names of that class
   are renamed in the subclass too, recursively up the whole chain. The

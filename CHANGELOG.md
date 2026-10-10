@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Fix: the members of a class declared in a package (a `.d.ts` in
+  `node_modules`) were renamed at their call sites with
+  `prefixPublicMembers`, while the package itself keeps the names:
+  `upload.start()` became `upload._start()`. Members, constructors and
+  functions declared outside the project are never renamed now.
+- Fix: the keys of an object pattern that destructures a class instance are
+  renamed along with the members: `const { container } = this` becomes
+  `const { _container: container } = this`. Before, the key kept its name and
+  the variable was `undefined`. Destructuring assignments and nested patterns
+  are covered too.
+
 ## 0.3.0
 
 - The plugin now asks the TypeScript type checker what every `object.x`
