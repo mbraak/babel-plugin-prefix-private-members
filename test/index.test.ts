@@ -1570,3 +1570,234 @@ describe("following types", () => {
         expect(code).toContain("_draw()");
     });
 });
+
+describe("classes from packages", () => {
+    const publicOptions: Options = { prefixPublicMembers: true };
+
+    const packageFiles = {
+        "node_modules/uploader/package.json": JSON.stringify({
+            name: "uploader",
+            types: "index.d.ts",
+        }),
+        "node_modules/uploader/index.d.ts": `
+            export interface UploadOptions {
+                endpoint: string;
+            }
+
+            export declare class Upload {
+                constructor(file: File, options: UploadOptions);
+                file: File;
+                url: string | null;
+                start(): void;
+                abort(shouldTerminate?: boolean): Promise<void>;
+            }
+        `,
+    };
+
+    it("keeps the members of a class declared in a package", () => {
+        const code = transformProject(
+            {
+                ...packageFiles,
+                "wrapper.ts": `
+                    import { Upload } from "uploader";
+
+                    export class Wrapper {
+                        private upload: Upload;
+
+                        constructor(file: File) {
+                            this.upload = new Upload(file, { endpoint: "/" });
+                        }
+
+                        public start(): void {
+                            this.upload.start();
+                        }
+
+                        public getSize(): number {
+                            return this.upload.file.size;
+                        }
+
+                        public async abort(): Promise<void> {
+                            if (this.upload.url) {
+                                await this.upload.abort(true);
+                            }
+                        }
+                    }
+                `,
+            },
+            "wrapper.ts",
+            publicOptions,
+        );
+
+        expect(code).toContain("this._upload.start()");
+        expect(code).toContain("this._upload.file.size");
+        expect(code).toContain("this._upload.url");
+        expect(code).toContain("this._upload.abort(true)");
+        expect(code).toContain('{\n      endpoint: "/"');
+    });
+
+    it("keeps the keys of an object pattern typed with a class from a package", () => {
+        const code = transformProject(
+            {
+                ...packageFiles,
+                "wrapper.ts": `
+                    import { Upload } from "uploader";
+
+                    export const getUrl = (upload: Upload): string | null => {
+                        const { url } = upload;
+                        return url;
+                    };
+                `,
+            },
+            "wrapper.ts",
+            publicOptions,
+        );
+
+        expect(code).toContain("url\n  } = upload");
+    });
+});
+
+describe("object patterns", () => {
+    const publicOptions: Options = { prefixPublicMembers: true };
+
+    it("renames the keys of a pattern that destructures this", () => {
+        const code = transform(
+            `
+                class Field {
+                    renderer: string = "";
+                    private fieldName: string = "";
+
+                    public render(): string {
+                        const { fieldName, renderer } = this;
+                        return fieldName + renderer;
+                    }
+                }
+            `,
+            publicOptions,
+        );
+
+        expect(code).toMatch(
+            /const \{\s*_fieldName: fieldName,\s*_renderer: renderer\s*\} = this;/,
+        );
+    });
+
+    it("renames only the private keys without prefixPublicMembers", () => {
+        const code = transform(`
+            class Field {
+                public renderer: string = "";
+                private fieldName: string = "";
+
+                public render(): string {
+                    const { fieldName, renderer } = this;
+                    return fieldName + renderer;
+                }
+            }
+        `);
+
+        expect(code).toMatch(
+            /const \{\s*_fieldName: fieldName,\s*renderer\s*\} = this;/,
+        );
+    });
+
+    it("renames a key with a different local name and a default", () => {
+        const code = transform(`
+            class Field {
+                private input?: HTMLInputElement;
+
+                public clear(): void {
+                    const { input: element = null } = this;
+                    element?.remove();
+                }
+            }
+        `);
+
+        expect(code).toContain("_input: element = null");
+    });
+
+    it("renames the keys of a pattern that destructures a typed variable", () => {
+        const code = transform(`
+            class Node {
+                private parent: Node | null = null;
+
+                public static getParent(node: Node): Node | null {
+                    const { parent } = node;
+                    return parent;
+                }
+            }
+        `);
+
+        expect(code).toMatch(/const \{\s*_parent: parent\s*\} = node;/);
+    });
+
+    it("keeps the keys of a pattern that destructures an interface", () => {
+        const code = transform(
+            `
+                interface Callbacks {
+                    onDelete?: () => void;
+                }
+
+                class Field {
+                    private callbacks: Callbacks = {};
+
+                    public delete(): void {
+                        const { onDelete } = this.callbacks;
+                        onDelete?.();
+                    }
+                }
+            `,
+            publicOptions,
+        );
+
+        expect(code).toMatch(/const \{\s*onDelete\s*\} = this\._callbacks;/);
+    });
+
+    it("renames the keys of a destructuring assignment", () => {
+        const code = transform(`
+            class Field {
+                private input: string = "";
+
+                public read(): string {
+                    let input: string;
+                    ({ input } = this);
+                    return input;
+                }
+            }
+        `);
+
+        expect(code).toMatch(/\(\{\s*_input: input\s*\} = this\);/);
+    });
+
+    it("renames the keys of a nested pattern", () => {
+        const code = transform(`
+            class Child {
+                private name: string = "";
+            }
+
+            class Parent {
+                private child = new Child();
+
+                public getName(): string {
+                    const { child: { name } } = this;
+                    return name;
+                }
+            }
+        `);
+
+        expect(code).toMatch(/_child: \{\s*_name: name\s*\}/);
+    });
+
+    it("keeps the rest element of a pattern", () => {
+        const code = transform(`
+            class Field {
+                private input: string = "";
+
+                public copy(): object {
+                    const { input, ...rest } = this;
+                    return { input, rest };
+                }
+            }
+        `);
+
+        expect(code).toContain("_input: input,");
+        expect(code).toContain("...rest");
+    });
+});
